@@ -7,7 +7,7 @@
 ![Kernels](https://img.shields.io/badge/Kernels-17%20%2B%202%20%E5%9F%BA%E5%87%86-111827)
 ![License](https://img.shields.io/badge/License-MIT-9ca3af)
 
-从 CPU 三重循环的朴素 GPU 移植出发，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。末尾以 cuBLAS、cuBLASLt 两个工业基准作对照。
+从 CPU 三重循环的朴素 GPU 移植出发，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
 
 ### 测试环境
 
@@ -15,7 +15,7 @@ CUDA Event 计时，重复 100 次取平均值与中位数、5 轮交替采样�
 
 性能数据在同一台机器上分别用 `-arch=native` 和 `-arch=sm_80` 实测，不同编译器调度的测试结果略有不同，但总体趋势一致。
 
-RTX 5060 Laptop GPU（Blackwell，sm_120，26 个 SM）、`-arch=native`，中位耗时：
+RTX 5060 Laptop GPU（Blackwell，sm_120，26 个 SM）`-arch=native`，中位耗时：
 
 在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
 
@@ -37,39 +37,11 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。�
 
 ![GPU 存储层级](images/sib_18_memory_hierarchy.png)
 
-- **寄存器**：线程私有，单周期访问，每线程最多 255 个 32 位寄存器。累加器、预取寄存器、寄存器 fragment 都在这一层。
-- **共享内存（SMEM）**：一个 block 内共享，片上 SRAM，延迟数十周期，每 SM 上百 KB。本项目用 `As`、`Bs` 两个数组缓存矩阵分块，双缓冲版本动态申请 64 KB。
-- **L2 Cache**：全芯片共享，数十 MB，硬件自动管理。冷缓存模式会主动冲刷它。
-- **全局内存（显存）**：所有线程可见，容量 GB 级，延迟数百周期，带宽约 1 TB/s 量级。A、B、C 原始矩阵放在这里，是整个优化要减少访问的对象。
-
 ### 线程层级：Grid、Block、Thread
 
 一个 kernel 启动后，GPU 上的线程组织成三级结构。计算 C 矩阵时，Grid 按 block tile 铺满整个 C，每个 block 负责一个 tile，block 内每个线程再负责 tile 中的一小块。
 
 ![线程层级](images/sib_01_thread_hierarchy.png)
-
-### 三级 Tiling 总览
-
-GEMM4 之后的版本采用统一的三级划分：
-
-- Grid 按 128×128 的 block tile 铺满 C：`grid = (N/128, M/128)`；
-- 每个 block 16×16 共 256 个线程，协作计算一个 128×128 的 block tile；
-- 每个线程负责一个 8×8 的 thread tile，持有 64 个累加器；
-- K 方向每次推进 BK=32。
-
-GEMM12 在此基础上把 thread tile 放大到 16×8（每线程 128 个累加器）、线程数降到 128、BK 收到 16。
-
-![三级 Tiling](images/sib_19_tiling_overview.png)
-
-### 三层循环对应三级存储
-
-分块后的 kernel 是三层嵌套循环，每深入一层，数据就向计算单元靠近一级：
-
-![三层循环与三级存储](images/sib_13_loop_structure.png)
-
-1. **Loop 1**：每个 block 沿 K 循环，把 `As`、`Bs` 从全局内存搬到共享内存；
-2. **Loop 2**：每个线程沿 BK（dotIdx）循环，把 `As`、`Bs` 从共享内存搬到寄存器；
-3. **Loop 3 & 4**：寄存器里的标量进入 CUDA Core 做外积累加（FMA）。
 
 ---
 
@@ -158,6 +130,29 @@ for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
 ![协作加载](images/sib_07_gmem_loading.png)
 
 GEMM3、GEMM4 在 4096 尺寸分别为 3.76、6.47 TFLOPS。代价是寄存器：64 个累加器加寻址变量，单线程寄存器接近 100 个，占用率开始下降。
+
+### 三级 Tiling 总览
+
+GEMM4 之后的版本采用统一的三级划分：
+
+- Grid 按 128×128 的 block tile 铺满 C：`grid = (N/128, M/128)`；
+- 每个 block 16×16 共 256 个线程，协作计算一个 128×128 的 block tile；
+- 每个线程负责一个 8×8 的 thread tile，持有 64 个累加器；
+- K 方向每次推进 BK=32。
+
+GEMM12 在此基础上把 thread tile 放大到 16×8（每线程 128 个累加器）、线程数降到 128、BK 收到 16。
+
+![三级 Tiling](images/sib_19_tiling_overview.png)
+
+### 三层循环对应三级存储
+
+分块后的 kernel 是三层嵌套循环，每深入一层，数据就向计算单元靠近一级：
+
+![三层循环与三级存储](images/sib_13_loop_structure.png)
+
+1. **Loop 1**：每个 block 沿 K 循环，把 `As`、`Bs` 从全局内存搬到共享内存；
+2. **Loop 2**：每个线程沿 BK（dotIdx）循环，把 `As`、`Bs` 从共享内存搬到寄存器；
+3. **Loop 3 & 4**：寄存器里的标量进入 CUDA Core 做外积累加（FMA）。
 
 ### 阶段四：寄存器复用（GEMM5）
 
