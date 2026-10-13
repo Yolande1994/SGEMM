@@ -15,6 +15,8 @@ CUDA Event 计时，重复 100 次取平均值与中位数、交替采样、奇�
 
 本仓库所有性能数据在冷缓存基础下测得。同一台机器上分别用 `-arch=native` 和 `-arch=sm_80` 各实测一次，不同编译器调度的测试结果略有不同，但总体趋势一致。
 
+RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
+
 **性能总览（-arch=native）：**
 
 ![性能总览 native](images/perf_native.png)
@@ -22,8 +24,6 @@ CUDA Event 计时，重复 100 次取平均值与中位数、交替采样、奇�
 **性能总览（-arch=sm_80）：**
 
 ![性能总览 sm_80](images/perf_sm80.png)
-
-RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时，在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
 
 ---
 
