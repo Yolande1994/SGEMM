@@ -39,7 +39,7 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。�
 
 ### 线程层级：Grid、Block、Thread
 
-一个 kernel 启动后，GPU 上的线程组织成三级结构。计算 C 矩阵时，Grid 按 block tile 铺满整个 C，每个 block 负责一个 tile，block 内每个线程再负责 tile 中的一小块。
+一个 kernel 启动后，GPU 上的线程组织成三级结构。计算 C 矩阵时，Grid 内所有 block 铺满整个 C，每个 block 负责一个 tile，block 内每个线程再负责 tile 中的一个元素/一小块。
 
 ![线程层级](images/sib_01_thread_hierarchy.png)
 
@@ -47,7 +47,9 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。�
 
 ## 优化路线逐版本讲解
 
-计算 `C = A @ B`，`A (M,K)`、`B (K,N)`、`C (M,N)` 均为行主序。下文每节对应一个或几个 kernel，代码片段是核心逻辑，完整实现见 GEMM.cu 中对应函数。
+计算 `C = A @ B`，`A (M,K)`、`B (K,N)`、`C (M,N)` 均为行主序。
+
+下文代码片段是核心逻辑，完整实现见 GEMM.cu 中对应函数。
 
 ### 阶段一：朴素版与它的问题（GEMM1）
 
