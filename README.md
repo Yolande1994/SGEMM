@@ -7,35 +7,25 @@
 ![Kernels](https://img.shields.io/badge/Kernels-17%20%2B%202%20%E5%9F%BA%E5%87%86-111827)
 ![License](https://img.shields.io/badge/License-MIT-9ca3af)
 
-一个单文件 FP32 矩阵乘（SGEMM）的渐进优化项目。全部代码在 [GEMM.cu](GEMM.cu) 一个文件里：从 CPU 三重循环的朴素 GPU 移植出发，经过 12 个优化版本（共 17 个手写 kernel，含 5 个 B 系列变体），叠加共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、分块形状调参，最终在多数矩阵尺寸上跑赢 cuBLAS FP32；末尾附 cuBLAS、cuBLASLt 两个工业基准作对照。
+从 CPU 三重循环的朴素 GPU 移植出发，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。末尾以 cuBLAS、cuBLASLt 两个工业基准作对照。
 
-每个版本都有中文注释、对应的原理示意图、实测性能数据和 Nsight Compute 微结构分析。性能数据在同一台机器上分别用 `-arch=native` 和 `-arch=sm_80` 实测，冷缓存、交替采样、取中位耗时。
+### 测试环境
+
+CUDA Event 计时，重复 100 次取平均值与中位数、5 轮交替采样、奇偶轮反转执行顺序；支持热缓存、冷缓存（冲刷 L2）两种模式。
+
+性能数据在同一台机器上分别用 `-arch=native` 和 `-arch=sm_80` 实测，不同编译器调度的测试结果略有不同，但总体趋势一致。
+
+RTX 5060 Laptop GPU（Blackwell，sm_120，26 个 SM）、`-arch=native`，中位耗时：
+
+在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
+
+**性能总览（-arch=native）：**
 
 ![性能总览 native](images/perf_native.png)
 
+**性能总览（-arch=sm_80）：**
+
 ![性能总览 sm_80](images/perf_sm80.png)
-
-## 这个项目里有什么
-
-- **19 个可测试版本**：GEMM1–GEMM12 共 17 个手写 kernel，加 cuBLAS、cuBLASLt 两个基准。每个版本都包含完整的加载、同步、计算、写回流程，不是教学用的伪代码。
-- **19 张中文原理示意图**：用 matplotlib 手绘风格绘制，从线程层级、访存合并、分块、bank 冲突到软件流水，每个优化点都有对应图示，脚本在 [scripts/siboehm_style.py](scripts/siboehm_style.py)。
-- **可复现的基准测试框架**：CUDA Event 计时，5 轮交替采样、奇偶轮反转执行顺序、慢 kernel 20 样本/其余 100 样本、报告平均值与中位数；支持热缓存、冷缓存（冲刷 L2）两种模式。
-- **两套编译目标实测数据**：同一份代码、同一台机器，对比 `-arch=native` 与 `-arch=sm_80`，观察编译器调度对不同写法的影响。
-- **Nsight Compute 采集命令与分析**：计算吞吐、显存吞吐、寄存器占用随版本的演进，用硬件计数器验证每一步优化的实际效果。
-
-## 关键结果
-
-M=N=K=4096、冷缓存、RTX 5060 Laptop GPU（Blackwell，sm_120，26 个 SM）、`-arch=native`，中位耗时：
-
-| 指标 | 数值 |
-| --- | --- |
-| GEMM1 朴素版 | 188.49 ms，0.73 TFLOPS |
-| GEMM12 最终版 | 12.67 ms，10.85 TFLOPS |
-| 端到端提速 | **14.9 倍** |
-| 同期 cuBLAS FP32 | 13.96 ms，9.85 TFLOPS |
-| GEMM12 相对 cuBLAS | **110%** |
-
-在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
 
 ---
 
@@ -216,37 +206,7 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 
 **GEMM7 是刻意保留的反面教材**。为了让 A 侧也能 float4 读取，把 `Bds` 从 `[BK][BN]` 改成 `[BN][BK]` 转置布局。转置后同一列（k 相同、n 不同）的地址相差 BK=32，恰好是 bank 数的整数倍，warp 内 32 个线程的访问全部落到同一个 bank，产生 32-way 冲突。NCU 实测计算吞吐利用率掉到 20.7%，4096 耗时 42.32 ms，比 GEMM6 慢一倍。
 
-```cpp
-// GEMM7 的布局改动：B 转置成 [BN][BK]，沿 k 连续，计算阶段才能用 float4 读
-__shared__ float Bds[BN][BK];   // 不再是 [BK][BN]
-
-// 加载：从全局读连续 n 方向的 float4，转置写入共享内存
-for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
-    int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
-    float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
-    Bds[n + 0][k] = v.x;  Bds[n + 1][k] = v.y;
-    Bds[n + 2][k] = v.z;  Bds[n + 3][k] = v.w;
-}
-
-// 计算：所有线程沿同一个 k 读 Bds[.][k]，落在同一 bank → 32-way 冲突
-for (int k = 0; k < BK; k += 4) {
-    float4 b_val[TN];
-    for (int j = 0; j < TN; j++)
-        b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
-    ...
-}
-```
-
 **GEMM7B** 用 `k_offset = tid*4` 循环移位，让不同线程从不同的 k 开始访问，把计算阶段的冲突降到 2-way；但加载阶段的 32-way 转置写入冲突没有处理，性能回到 6.46 TFLOPS，仍不如 GEMM6。
-
-```cpp
-// GEMM7B 与 GEMM7 唯一区别：k 的起点按线程编号旋转
-// 线程 tid 从 k = tid*4 开始，绕一圈回到起点，warp 内 32 个线程的起始 k 各不相同
-for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
-    int k = k_offset % BK;   // 访问被打散到不同 bank
-    ...
-}
-```
 
 **GEMM8 用 XOR Swizzle 一次性解决两处冲突**。不改变存储大小，只把行号的几个位异或进列地址，让同一列在不同行落到不同 bank；float4 粒度保持，对齐不受影响。
 
@@ -269,25 +229,6 @@ auto swizzle = [](int n, int k) {
 分块后的每个 tile 要经历"加载 → 同步 → 计算 → 同步"，加载和计算严格串行。流水线的目标是让加载下一块和计算当前块重叠。
 
 **GEMM9 朴素双缓冲**。开两份共享内存 `[2][BM][BK]`，计算当前块的同时预取下一块，交替使用（ping-pong）。共享内存翻倍到 64 KB，需要用 `cudaFuncSetAttribute` 提高单 block 动态共享内存上限。
-
-```cpp
-// GEMM9：动态共享内存 64 KB，开两份 buffer（ping-pong）
-extern __shared__ char smem[];
-auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
-auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
-// launch 前必须提高单 block 动态共享内存上限
-cudaFuncSetAttribute(GEMM9, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
-
-// 主循环：先把下一 tile 预取进 next_buf，再计算当前 buf
-for (int tile = 0; tile < K; tile += BK) {
-    if (next_tile < K) {
-        // LDG + 转置 STS 写进 Ads[next_buf] / Bds[next_buf]
-    }
-    /* 计算 Ads[buf] / Bds[buf] 的 FMA */
-    __syncthreads();
-    buf = next_buf;   // 切换 buffer
-}
-```
 
 ![双缓冲](images/sib_14_double_buffer.png)
 
@@ -325,19 +266,6 @@ if (next_tile < K) commit_store(a_next, b_next, next_buf);
 
 **GEMM10B 混合流水**：A 不需要转置，改用 cp.async 直拷，省 4 个 float4 预取寄存器；B 保留寄存器预取。4096 尺寸 8.17 TFLOPS，寄存器从 155 降到 141。
 
-```cpp
-#if __CUDA_ARCH__ >= 800
-// A：发 cp.async 直拷（DMA 后台搬运，不占寄存器）
-issue_a_copy(next_buf, next_tile);
-// B：仍走 LDG 到预取寄存器（需要转置+swizzle，cp.async 搬不了）
-issue_b_load(next_tile);
-asm volatile("cp.async.commit_group;" ::: "memory");
-asm volatile("cp.async.wait_group 1;" ::: "memory");  // 只等 current 到位，next 继续飞
-/* ... 计算 current（B 的 LDG 延迟被 FMA 盖住）... */
-commit_b_store(next_buf);   // B 的转置+swizzle 落共享
-#endif
-```
-
 ### 阶段八：两级流水线（GEMM11、GEMM11B）
 
 GEMM10 只把"全局→共享"做成流水，"共享→寄存器"仍然与 FMA 串行，BK=32 时共享内存读延迟累积 32 次。GEMM11 把寄存器 fragment 也开双缓冲，流水线扩成三级：
@@ -360,27 +288,6 @@ for (int bk = 0; bk < BK - 1; bk++) {
 
 GEMM11B 中 B 的共享内存形状 `[BK][BN]` 与全局行主序完全对齐，不需要转置，B 路也换成 cp.async（`wait_group 0`），A 路保留软件转置。4096 尺寸 GEMM11 / GEMM11B 为 7.72 / 8.39 TFLOPS，NCU 显存吞吐从 46% 升到 83.5%。
 
-```cpp
-#if __CUDA_ARCH__ >= 800
-// B 布局与全局对齐、无转置 → 整条 B 路交给 DMA，代码只有 4 行
-auto issue_b_copy = [&](int b, int tile) {
-    for (int i = 0; i < 4; i++) {
-        int idx = tid + i * 256;
-        int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
-            : : "l"(&Bds[b][k][n]),
-                "l"(&B[(tile + k) * N + blockIdx.x * BN + n]) : "memory");
-    }
-};
-issue_a_load(next_tile);                    // A：LDG 中转（需转置）
-issue_b_copy(next_buf, next_tile);          // B：cp.async 直拷
-asm volatile("cp.async.commit_group;" ::: "memory");
-/* ... 内层 fragment 流水做完整块 FMA ... */
-asm volatile("cp.async.wait_group 0;" ::: "memory");  // B 全部到位再落 A
-commit_a_store(next_buf);
-#endif
-```
-
 ### 阶段九：分块形状调参（GEMM12）
 
 在本机上重新选择分块形状：BK 32→16、TM 8→16、TN 保持 8、线程 256→128。
@@ -389,28 +296,6 @@ commit_a_store(next_buf);
 constexpr int BK = 16, BM = 128, BN = 128, TM = 16, TN = 8;
 constexpr int BLOCK_THREADS = 128;   // dim3 block(16, 8)
 constexpr int A_ROUNDS = BK * BM / BLOCK_THREADS / 4;  // 每线程 4 个 float4
-constexpr int B_ROUNDS = BK * BN / BLOCK_THREADS / 4;
-
-// 主循环：三级流水同时推进（128 线程，BK=16 只有 15 次内层迭代）
-for (int tile = 0; tile < K; tile += BK) {
-    if (next_tile < K) {
-        issue_a_load(next_tile);            // A：LDG 到 ldg_a（软件转置需要）
-        issue_b_copy(next_buf, next_tile);  // B：cp.async 直拷
-        asm volatile("cp.async.commit_group;" ::: "memory");
-    }
-    for (int bk = 0; bk < BK - 1; bk++) {   // 内层 fragment 双缓冲
-        issue_frag_load(buf, bk);           // 预取 bk+1 排（共享 → 寄存器）
-        commit_frag_fma(bk);                // 算 bk 排（寄存器 FMA）
-    }
-    commit_frag_fma(BK - 1);
-    if (next_tile < K) {
-        asm volatile("cp.async.wait_group 0;" ::: "memory"); // B 全部到位
-        commit_a_store(next_buf);           // A 转置落共享
-        __syncthreads();
-        /* 预取 next 的 fragment 到 a_frag[0] / b_frag[0] */
-    }
-    buf = next_buf;
-}
 ```
 
 两个方向的调整：
@@ -488,7 +373,7 @@ nvcc -O3 --use_fast_math -Xcompiler -fopenmp \
 
 ```bash
 python plot.py                   # 5 张数据图：性能总览×2、cuBLAS 占比、NCU 吞吐、寄存器
-python scripts/siboehm_style.py  # 19 张原理示意图（PNG，150 dpi）
+python scripts/siboehm_style.py  # 19 张原理示意图（PNG + SVG）
 ```
 
 ## 基准测试方法
@@ -574,7 +459,7 @@ GEMM/
 ├── plot.py                      # 数据图脚本：性能总览、cuBLAS 占比、NCU 吞吐与寄存器
 ├── scripts/
 │   └── siboehm_style.py         # 19 张原理示意图的绘图脚本
-├── images/                      # 全部图表（PNG，150 dpi，README 直接引用）
+├── images/                      # 全部图表（PNG 位图 + SVG 矢量图，README 引用 PNG）
 ├── test/
 │   ├── benchmark_native.txt     # -arch=native 完整原始输出（19 版本 × 6 尺寸）
 │   ├── benchmark_sm80.txt       # -arch=sm_80 完整原始输出
