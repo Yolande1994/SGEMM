@@ -47,7 +47,7 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。�
 
 ## 优化路线逐版本讲解
 
-计算 `C = A @ B`，`A (M,K)`、`B (K,N)`、`C (M,N)` 均为行主序。
+计算 `C = A @ B`，`A (M,K)`、`B (K,N)`、`C (M,N)` ，均为行主序。
 
 下文代码片段是核心逻辑，完整实现见 GEMM.cu 中对应函数。
 
@@ -194,6 +194,26 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 ```
 
 前提是地址 16 字节对齐、K 与 N 能被 4 整除（矩阵按 16 对齐分配）。GEMM6 的 A、B 加载和 C 写回都用 float4。GEMM6B 进一步把计算阶段读 Bds 也改为 float4（Ads 沿行跨 BK 不连续，无法向量化），再带来约 2%~12% 收益。4096 尺寸 GEMM6 为 6.58 TFLOPS、GEMM6B 为 7.40 TFLOPS。
+```cpp
+// GEMM6B 新增：计算阶段读 Bds 也改成 float4，LDS 指令数压到 1/4
+// （Ads 沿行跨 BK 不连续，无法向量化，保持标量读）
+for (int k = 0; k < BK; k++) {
+    float4 b_val4[TN / 4];
+    for (int j = 0; j < TN; j += 4)
+        b_val4[j / 4] = *(const float4*)&Bds[k][tx * TN + j];   // 4 个 float 一次读
+    for (int i = 0; i < TM; i++) {
+        float a_val = Ads[ty * TM + i][k];
+        for (int j = 0; j < TN; j += 4) {
+            val[i][j+0] += a_val * b_val4[j/4].x;
+            val[i][j+1] += a_val * b_val4[j/4].y;
+            val[i][j+2] += a_val * b_val4[j/4].z;
+            val[i][j+3] += a_val * b_val4[j/4].w;
+        }
+    }
+}
+```
+
+
 
 ### 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
@@ -202,8 +222,40 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 ![Bank 冲突](images/sib_11_bank_conflict.png)
 
 **GEMM7 是刻意保留的反面教材**。为了让 A 侧也能 float4 读取，把 `Bds` 从 `[BK][BN]` 改成 `[BN][BK]` 转置布局。转置后同一列（k 相同、n 不同）的地址相差 BK=32，恰好是 bank 数的整数倍，warp 内 32 个线程的访问全部落到同一个 bank，产生 32-way 冲突。NCU 实测计算吞吐利用率掉到 20.7%，4096 耗时 42.32 ms，比 GEMM6 慢一倍。
+```cpp
+// GEMM7 的布局改动：B 转置成 [BN][BK]，沿 k 连续，计算阶段才能用 float4 读
+__shared__ float Bds[BN][BK];   // 不再是 [BK][BN]
+
+// 加载：从全局读连续 n 方向的 float4，转置写入共享内存
+for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+    int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+    float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+    Bds[n + 0][k] = v.x;  Bds[n + 1][k] = v.y;
+    Bds[n + 2][k] = v.z;  Bds[n + 3][k] = v.w;
+}
+
+// 计算：所有线程沿同一个 k 读 Bds[.][k]，落在同一 bank → 32-way 冲突
+for (int k = 0; k < BK; k += 4) {
+    float4 b_val[TN];
+    for (int j = 0; j < TN; j++)
+        b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
+    ...
+}
+```
+
+
 
 **GEMM7B** 用 `k_offset = tid*4` 循环移位，让不同线程从不同的 k 开始访问，把计算阶段的冲突降到 2-way；但加载阶段的 32-way 转置写入冲突没有处理，性能回到 6.46 TFLOPS，仍不如 GEMM6。
+```cpp
+// GEMM7B 与 GEMM7 唯一区别：k 的起点按线程编号旋转
+// 线程 tid 从 k = tid*4 开始，绕一圈回到起点，warp 内 32 个线程的起始 k 各不相同
+for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
+    int k = k_offset % BK;   // 访问被打散到不同 bank
+    ...
+}
+```
+
+
 
 **GEMM8 用 XOR Swizzle 一次性解决两处冲突**。不改变存储大小，只把行号的几个位异或进列地址，让同一列在不同行落到不同 bank；float4 粒度保持，对齐不受影响。
 
@@ -226,6 +278,26 @@ auto swizzle = [](int n, int k) {
 分块后的每个 tile 要经历"加载 → 同步 → 计算 → 同步"，加载和计算严格串行。流水线的目标是让加载下一块和计算当前块重叠。
 
 **GEMM9 朴素双缓冲**。开两份共享内存 `[2][BM][BK]`，计算当前块的同时预取下一块，交替使用（ping-pong）。共享内存翻倍到 64 KB，需要用 `cudaFuncSetAttribute` 提高单 block 动态共享内存上限。
+```cpp
+// GEMM9：动态共享内存 64 KB，开两份 buffer（ping-pong）
+extern __shared__ char smem[];
+auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
+auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
+// launch 前必须提高单 block 动态共享内存上限
+cudaFuncSetAttribute(GEMM9, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+
+// 主循环：先把下一 tile 预取进 next_buf，再计算当前 buf
+for (int tile = 0; tile < K; tile += BK) {
+    if (next_tile < K) {
+        // LDG + 转置 STS 写进 Ads[next_buf] / Bds[next_buf]
+    }
+    /* 计算 Ads[buf] / Bds[buf] 的 FMA */
+    __syncthreads();
+    buf = next_buf;   // 切换 buffer
+}
+```
+
+
 
 ![双缓冲](images/sib_14_double_buffer.png)
 
@@ -262,6 +334,20 @@ if (next_tile < K) commit_store(a_next, b_next, next_buf);
 4096 尺寸 native 下 7.73 TFLOPS，比 GEMM9 快 14%；`-arch=sm_80` 下快 34%，显式调度的优势被放大。
 
 **GEMM10B 混合流水**：A 不需要转置，改用 cp.async 直拷，省 4 个 float4 预取寄存器；B 保留寄存器预取。4096 尺寸 8.17 TFLOPS，寄存器从 155 降到 141。
+```cpp
+#if __CUDA_ARCH__ >= 800
+// A：发 cp.async 直拷（DMA 后台搬运，不占寄存器）
+issue_a_copy(next_buf, next_tile);
+// B：仍走 LDG 到预取寄存器（需要转置+swizzle，cp.async 搬不了）
+issue_b_load(next_tile);
+asm volatile("cp.async.commit_group;" ::: "memory");
+asm volatile("cp.async.wait_group 1;" ::: "memory");  // 只等 current 到位，next 继续飞
+/* ... 计算 current（B 的 LDG 延迟被 FMA 盖住）... */
+commit_b_store(next_buf);   // B 的转置+swizzle 落共享
+#endif
+```
+
+
 
 ### 阶段八：两级流水线（GEMM11、GEMM11B）
 
@@ -284,6 +370,28 @@ for (int bk = 0; bk < BK - 1; bk++) {
 ```
 
 GEMM11B 中 B 的共享内存形状 `[BK][BN]` 与全局行主序完全对齐，不需要转置，B 路也换成 cp.async（`wait_group 0`），A 路保留软件转置。4096 尺寸 GEMM11 / GEMM11B 为 7.72 / 8.39 TFLOPS，NCU 显存吞吐从 46% 升到 83.5%。
+```cpp
+#if __CUDA_ARCH__ >= 800
+// B 布局与全局对齐、无转置 → 整条 B 路交给 DMA，代码只有 4 行
+auto issue_b_copy = [&](int b, int tile) {
+    for (int i = 0; i < 4; i++) {
+        int idx = tid + i * 256;
+        int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+            : : "l"(&Bds[b][k][n]),
+                "l"(&B[(tile + k) * N + blockIdx.x * BN + n]) : "memory");
+    }
+};
+issue_a_load(next_tile);                    // A：LDG 中转（需转置）
+issue_b_copy(next_buf, next_tile);          // B：cp.async 直拷
+asm volatile("cp.async.commit_group;" ::: "memory");
+/* ... 内层 fragment 流水做完整块 FMA ... */
+asm volatile("cp.async.wait_group 0;" ::: "memory");  // B 全部到位再落 A
+commit_a_store(next_buf);
+#endif
+```
+
+
 
 ### 阶段九：分块形状调参（GEMM12）
 
@@ -293,6 +401,28 @@ GEMM11B 中 B 的共享内存形状 `[BK][BN]` 与全局行主序完全对齐，
 constexpr int BK = 16, BM = 128, BN = 128, TM = 16, TN = 8;
 constexpr int BLOCK_THREADS = 128;   // dim3 block(16, 8)
 constexpr int A_ROUNDS = BK * BM / BLOCK_THREADS / 4;  // 每线程 4 个 float4
+constexpr int B_ROUNDS = BK * BN / BLOCK_THREADS / 4;
+
+// 主循环：三级流水同时推进（128 线程，BK=16 只有 15 次内层迭代）
+for (int tile = 0; tile < K; tile += BK) {
+    if (next_tile < K) {
+        issue_a_load(next_tile);            // A：LDG 到 ldg_a（软件转置需要）
+        issue_b_copy(next_buf, next_tile);  // B：cp.async 直拷
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    for (int bk = 0; bk < BK - 1; bk++) {   // 内层 fragment 双缓冲
+        issue_frag_load(buf, bk);           // 预取 bk+1 排（共享 → 寄存器）
+        commit_frag_fma(bk);                // 算 bk 排（寄存器 FMA）
+    }
+    commit_frag_fma(BK - 1);
+    if (next_tile < K) {
+        asm volatile("cp.async.wait_group 0;" ::: "memory"); // B 全部到位
+        commit_a_store(next_buf);           // A 转置落共享
+        __syncthreads();
+        /* 预取 next 的 fragment 到 a_frag[0] / b_frag[0] */
+    }
+    buf = next_buf;
+}
 ```
 
 两个方向的调整：
