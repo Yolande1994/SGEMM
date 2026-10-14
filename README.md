@@ -120,14 +120,9 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-**一些问题：**
-- 每个线程只算一个输出。每做一次 FMA，就要读两次全局内存，计算和访存的比例是 1:2，极低，SM 浮点运算单元跑不满，无法隐藏访存延迟。
-- 每个 C 元素都要读一整行 A 和一整列 B，相同位置元素被重复读取，完成全部计算需要 2 * K * M * N。要知道全局内存访问延迟最高，频繁重复的访问浪费大量时间。
-
-**4096 尺寸性能（GEMM1）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -135,6 +130,10 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 <tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
 </tbody>
 </table>
+
+**一些问题：**
+- 每个线程只算一个输出。每做一次 FMA，就要读两次全局内存，计算和访存的比例是 1:2，极低，SM 浮点运算单元跑不满，无法隐藏访存延迟。
+- 每个 C 元素都要读一整行 A 和一整列 B，相同位置元素被重复读取，完成全部计算需要 2 * K * M * N。要知道全局内存访问延迟最高，频繁重复的访问浪费大量时间。
 
 <br>
 
@@ -183,18 +182,9 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-**收益：**
-
-A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元素被 tx 方向的 32 个线程共用。
-
-这样就不用频繁访问全局内存，全局访存量从 O(M*N*K) 降到 O(M*N*K/32)，减少 32 倍。
-
-另外因访问地址转移到延迟低得多的 shared memory，计算效率也得到一些提升。
-
-**GEMM2 vs GEMM1（4096 尺寸）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -203,6 +193,14 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 <tr><td>GEMM2</td><td align="right">110.52</td><td align="right">1.24</td><td align="right">12.6%</td><td align="right">108.29</td><td align="right">1.27</td><td align="right">13.2%</td></tr>
 </tbody>
 </table>
+
+**收益：**
+
+A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元素被 tx 方向的 32 个线程共用。
+
+这样就不用频繁访问全局内存，全局访存量从 O(M*N*K) 降到 O(M*N*K/32)，减少 32 倍。
+
+另外因访问地址转移到延迟低得多的 shared memory，计算效率也得到一些提升。
 
 <br>
 
@@ -214,10 +212,9 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 ![一维线程粗化](images/sib_05_1d_blocktiling.png)
 
-**4096 尺寸性能对比（GEMM3 vs GEMM2）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -233,10 +230,9 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 ![二维线程粗化](images/sib_06_2d_blocktiling.png)
 
-**4096 尺寸性能对比（GEMM4 vs GEMM3）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -308,12 +304,9 @@ for (int k = 0; k < BK; k++) {
 
 ![寄存器外积](images/sib_08_reg_blocking.png)
 
-GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器），本质都是把数据往快层搬。本机性能与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS），因为此时瓶颈已转向全局访存的指令数，但这一版确定了后续所有 kernel 的内层结构。
-
-**4096 尺寸性能对比（GEMM5 vs GEMM4）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -322,6 +315,9 @@ GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存�
 <tr><td>GEMM5</td><td align="right">21.00</td><td align="right">6.55</td><td align="right">66.5%</td><td align="right">42.00</td><td align="right">3.27</td><td align="right">34.1%</td></tr>
 </tbody>
 </table>
+
+GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器），本质都是把数据往快层搬。本机性能与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS），因为此时瓶颈已转向全局访存的指令数，但这一版确定了后续所有 kernel 的内层结构。
+
 
 GEMM5 把共享内存访问次数从 64 次降到 16 次，但本机上 shared 带宽还不是瓶颈，所以性能几乎不变；它真正的价值是确立了后续所有 kernel 的内层结构（先读寄存器再算 FMA）。sm_80 下小幅回落同样是编译器调度差异。
 <br>
@@ -340,12 +336,9 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 }
 ```
 
-前提是地址 16 字节对齐、K 与 N 能被 4 整除（矩阵按 16 对齐分配）。GEMM6 的 A、B 加载和 C 写回都用 float4。GEMM6B 进一步把计算阶段读 Bds 也改为 float4（Ads 沿行跨 BK 不连续，无法向量化），再带来约 2%~12% 收益。4096 尺寸 GEMM6 为 6.58 TFLOPS、GEMM6B 为 7.40 TFLOPS。
-
-**4096 尺寸性能对比（GEMM6 vs GEMM5）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -354,6 +347,9 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 <tr><td>GEMM6</td><td align="right">20.88</td><td align="right">6.58</td><td align="right">66.8%</td><td align="right">19.67</td><td align="right">6.99</td><td align="right">72.8%</td></tr>
 </tbody>
 </table>
+
+前提是地址 16 字节对齐、K 与 N 能被 4 整除（矩阵按 16 对齐分配）。GEMM6 的 A、B 加载和 C 写回都用 float4。GEMM6B 进一步把计算阶段读 Bds 也改为 float4（Ads 沿行跨 BK 不连续，无法向量化），再带来约 2%~12% 收益。4096 尺寸 GEMM6 为 6.58 TFLOPS、GEMM6B 为 7.40 TFLOPS。
+
 
 native 下 float4 收益很小，因为 native 后端本身已把标量加载合并得不错；sm_80 后端下访存指令数直接减到 1/4，收益被放大到 2 倍多。同一份代码，两个编译目标的表现天差地别。
 ```cpp
@@ -375,10 +371,9 @@ for (int k = 0; k < BK; k++) {
 }
 ```
 
-**4096 尺寸性能对比（GEMM6B vs GEMM6）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -420,10 +415,9 @@ for (int k = 0; k < BK; k += 4) {
 ```
 
 
-**4096 尺寸性能对比（GEMM7 vs GEMM6B）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -447,10 +441,9 @@ for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
 ```
 
 
-**4096 尺寸性能对比（GEMM7B vs GEMM7）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -477,12 +470,9 @@ auto swizzle = [](int n, int k) {
 
 ![XOR Swizzle](images/sib_12_swizzle.png)
 
-加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
-
-**4096 尺寸性能对比（GEMM8 vs GEMM7B）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -491,6 +481,9 @@ auto swizzle = [](int n, int k) {
 <tr><td>GEMM8</td><td align="right">16.27</td><td align="right">8.45</td><td align="right">85.8%</td><td align="right">17.81</td><td align="right">7.72</td><td align="right">80.4%</td></tr>
 </tbody>
 </table>
+
+加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
+
 
 XOR Swizzle 把两处冲突一起解决，不仅恢复还超过了 GEMM6B，是解决 bank 冲突的通用方案。
 <br>
@@ -519,16 +512,11 @@ for (int tile = 0; tile < K; tile += BK) {
 }
 ```
 
-
-
 ![双缓冲](images/sib_14_double_buffer.png)
-
-但这一版实测 6.68 TFLOPS，没有比 GEMM8 快。原因是加载下一 tile 的代码整段排在计算前面，LDG 一次性发完、STS 全部写完才进入计算，编译器找不到交错调度点，双缓冲开了却没有形成流水。这是"写了双缓冲不等于有流水线"的典型案例。
-
-**4096 尺寸性能对比（GEMM9 vs GEMM8）：**
 
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -537,6 +525,9 @@ for (int tile = 0; tile < K; tile += BK) {
 <tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
 </tbody>
 </table>
+
+但这一版实测 6.68 TFLOPS，没有比 GEMM8 快。原因是加载下一 tile 的代码整段排在计算前面，LDG 一次性发完、STS 全部写完才进入计算，编译器找不到交错调度点，双缓冲开了却没有形成流水。这是"写了双缓冲不等于有流水线"的典型案例。
+
 
 诚实交代：这一版是负优化。双缓冲的代码写了，但"预取整段排在计算前面"导致 LDG 延迟没有被覆盖，编译器也找不到交错点；64 KB 共享内存还压低了占用率。这是"写了双缓冲不等于有流水线"的典型反例，也是后面 GEMM10 要解决的问题。
 
@@ -551,12 +542,9 @@ asm volatile("cp.async.commit_group;" ::: "memory");
 asm volatile("cp.async.wait_group 1;" ::: "memory");
 ```
 
-由于 B 需要转置加 swizzle，cp.async 只能做直线拷贝，本版只有 A 侧真正异步（半流水），性能 6.72 TFLOPS。架构低于 sm_80 时通过 `#if __CUDA_ARCH__ >= 800` 自动回退到软件加载。
-
-**4096 尺寸性能对比（GEMM9B vs GEMM9）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -565,6 +553,9 @@ asm volatile("cp.async.wait_group 1;" ::: "memory");
 <tr><td>GEMM9B</td><td align="right">20.46</td><td align="right">6.72</td><td align="right">68.2%</td><td align="right">23.57</td><td align="right">5.83</td><td align="right">60.8%</td></tr>
 </tbody>
 </table>
+
+由于 B 需要转置加 swizzle，cp.async 只能做直线拷贝，本版只有 A 侧真正异步（半流水），性能 6.72 TFLOPS。架构低于 sm_80 时通过 `#if __CUDA_ARCH__ >= 800` 自动回退到软件加载。
+
 
 cp.async 把 A 侧的加载交给 DMA 引擎。native 下收益很小，因为软件预取被编译器优化得已经不错；sm_80 下 DMA 的异步优势才真正显现——优化手段的价值同样取决于编译目标。
 
@@ -579,16 +570,9 @@ if (next_tile < K) issue_load(a_next, b_next, next_tile);
 if (next_tile < K) commit_store(a_next, b_next, next_buf);
 ```
 
-利用的是硬件 scoreboard 机制：写寄存器不阻塞，只有读它的时候才等待。A、B 两路都走这条路，是全流水；每线程多持有 8 个 float4 预取寄存器。
-
-![寄存器流水](images/sib_16_register_pipeline.png)
-
-4096 尺寸 native 下 7.73 TFLOPS，比 GEMM9 快 14%；`-arch=sm_80` 下快 34%，显式调度的优势被放大。
-
-**4096 尺寸性能对比（GEMM10 vs GEMM9）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -597,6 +581,13 @@ if (next_tile < K) commit_store(a_next, b_next, next_buf);
 <tr><td>GEMM10</td><td align="right">17.79</td><td align="right">7.73</td><td align="right">78.5%</td><td align="right">19.17</td><td align="right">7.17</td><td align="right">74.7%</td></tr>
 </tbody>
 </table>
+
+利用的是硬件 scoreboard 机制：写寄存器不阻塞，只有读它的时候才等待。A、B 两路都走这条路，是全流水；每线程多持有 8 个 float4 预取寄存器。
+
+![寄存器流水](images/sib_16_register_pipeline.png)
+
+4096 尺寸 native 下 7.73 TFLOPS，比 GEMM9 快 14%；`-arch=sm_80` 下快 34%，显式调度的优势被放大。
+
 
 把"加载"拆成 issue（发 LDG 不等）和 commit（消费时才等），中间填 FMA，这才让双缓冲真正流起来。sm_80 后端不会自动做这种调度，显式排布的收益被放大。
 
@@ -615,10 +606,9 @@ commit_b_store(next_buf);   // B 的转置+swizzle 落共享
 ```
 
 
-**4096 尺寸性能对比（GEMM10B vs GEMM10）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -652,10 +642,9 @@ for (int bk = 0; bk < BK - 1; bk++) {
 ```
 
 
-**4096 尺寸性能对比（GEMM11 vs GEMM10B）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -690,10 +679,9 @@ commit_a_store(next_buf);
 ```
 
 
-**4096 尺寸性能对比（GEMM11B vs GEMM11）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -738,17 +726,9 @@ for (int tile = 0; tile < K; tile += BK) {
 }
 ```
 
-两个方向的调整：
-
-1. **K 分块收窄**：双缓冲共享内存从 64 KB 减半到 32 KB；K 循环次数翻倍，流水步长更细，延迟隐藏更充分。
-2. **计算粒度放大**：每线程从 64 个累加器增到 128 个（16×8 细长 tile），线程数减半，单线程指令级并行（ILP）更强，编译器更容易排满流水线。
-
-代价是每线程 247 个寄存器（NCU 实测），占用率降到约 2 block/SM——用占用率换单线程 ILP。GEMM12 同时用上两级流水、A 侧软件转置预取、B 侧 cp.async、float4 与 swizzle，是全部优化的集大成版本，4096 尺寸 10.85 TFLOPS，超过 cuBLAS 的 9.85 TFLOPS。
-
-**4096 尺寸性能对比（GEMM12 vs GEMM11B）：**
-
 <table>
 <thead>
+<tr><th colspan="7" align="center">4096 尺寸</th></tr>
 <tr><th rowspan="2">版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
 <tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
@@ -757,6 +737,14 @@ for (int tile = 0; tile < K; tile += BK) {
 <tr><td>GEMM12</td><td align="right">12.67</td><td align="right">10.85</td><td align="right">110.2%</td><td align="right">13.77</td><td align="right">9.98</td><td align="right">104.0%</td></tr>
 </tbody>
 </table>
+
+两个方向的调整：
+
+1. **K 分块收窄**：双缓冲共享内存从 64 KB 减半到 32 KB；K 循环次数翻倍，流水步长更细，延迟隐藏更充分。
+2. **计算粒度放大**：每线程从 64 个累加器增到 128 个（16×8 细长 tile），线程数减半，单线程指令级并行（ILP）更强，编译器更容易排满流水线。
+
+代价是每线程 247 个寄存器（NCU 实测），占用率降到约 2 block/SM——用占用率换单线程 ILP。GEMM12 同时用上两级流水、A 侧软件转置预取、B 侧 cp.async、float4 与 swizzle，是全部优化的集大成版本，4096 尺寸 10.85 TFLOPS，超过 cuBLAS 的 9.85 TFLOPS。
+
 
 形状调参是最后一块拼图：BK 收窄让流水步长更细，TM 放大让单线程 ILP 更强。native 下首次超过 cuBLAS（110.2%），sm_80 下也达到 104%。
 
