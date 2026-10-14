@@ -87,24 +87,28 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。
 
 下文代码片段是核心逻辑，完整实现见 GEMM.cu 中对应函数。
 
-### 阶段一：朴素版与它的问题（GEMM1）
+---
+
+## 阶段一：朴素版（GEMM1）
 
 一个线程负责一个输出元素 `C[row][col]`，沿 K 串行读取 A 的一行和 B 的一列做点积。
 
+![GEMM1](images/GEMM1.png)
+
 ```cpp
 __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, int K) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < M && col < N) {
+    // 每个线程计算一个输出元素 C[row, col]
+    int row = blockIdx.y * blockDim.y + threadIdx.y;  // 全局行号
+    int col = blockIdx.x * blockDim.x + threadIdx.x;  // 全局列号
+    if (row < M && col < N) {  // 避免越界
         float sum = 0.0f;
+        // 串行遍历 K 维度，完成点积
         for (int k = 0; k < K; k++)
             sum += A[row * K + k] * B[k * N + col];
-        C[row * N + col] = sum;
+        C[row * N + col] = sum;  // 每个线程写入自己负责的输出位
     }
 }
 ```
-
-一个线程的访问路径：A 沿行读，地址连续；B 沿列读，相邻元素跨 N 个 float，地址不连续。
 
 ![GEMM1 访存](images/sib_02_naive_mem.png)
 
@@ -120,22 +124,41 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 
 4096 尺寸实测 0.73 TFLOPS，只有 cuBLAS 的 7.4%。
 
-### 阶段二：共享内存分块（GEMM2）
+<br>
 
-一个 32×32 的输出 tile 里，所有线程合起来只用到 32 行 A 和 32 列 B。先把这两块数据搬到共享内存，块内线程再从共享内存读，A 的每个元素被 32 个线程共用，B 同理，全局访存量降到约 1/32。
+## 阶段二：共享内存分块（GEMM2）
+
+一个 32×32 的输出 tile 里，所有线程合起来只用到 32 行 A 和 32 列 B。
+
+先把这两块数据搬到共享内存，块内线程再从共享内存读，A 的每个元素被 32 个线程共用，B 同理，全局访存量降到约 1/32。
+
+![GEMM2](images/GEMM2.png)
 
 ```cpp
-constexpr int BK = 32, BM = 32, BN = 32;
-__shared__ float Ads[BM][BK];
-__shared__ float Bds[BK][BN];
-
-for (int tile = 0; tile < K; tile += BK) {
-    Ads[ty][tx] = A[row * K + tile + tx];   // 协作加载
-    Bds[ty][tx] = B[(tile + ty) * N + col];
-    __syncthreads();
-    for (int k = 0; k < BK; k++)
-        sum += Ads[ty][k] * Bds[k][tx];     // 只从共享内存读
-    __syncthreads();
+__global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 32, BN = 32;  // 共享内存边长大小
+    // 把 A、B 的 32x32 tile 搬到 shared memory 让块内线程共享（本版核心优化）
+    __shared__ float Ads[BM][BK];  // A 的 32x32 子块缓存
+    __shared__ float Bds[BK][BN];  // B 的 32x32 子块缓存
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int row = blockIdx.y * BM + ty;
+    int col = blockIdx.x * BN + tx;
+    float sum = 0.0f;  // 每线程 1 个输出的累加器
+    // 还是沿公共维度，但每次跨步 BK=32
+    for (int tile = 0; tile < K; tile += BK) {
+        // 协作加载 A 子块到共享内存
+        Ads[ty][tx] = (row < M && tile + tx < K) ? A[row * K + tile + tx] : 0.0f;
+        // 协作加载 B 子块到共享内存
+        Bds[ty][tx] = (tile + ty < K && col < N) ? B[(tile + ty) * N + col] : 0.0f;
+        // 等待所有线程完成加载
+        __syncthreads();
+        // 从共享内存中读取数据进行乘加
+        for (int k = 0; k < BK; k++)
+            sum += Ads[ty][k] * Bds[k][tx];
+        // 同步，确保计算完成后再覆盖共享内存
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = sum;
 }
 ```
 
@@ -143,7 +166,9 @@ for (int tile = 0; tile < K; tile += BK) {
 
 4096 尺寸提升到 1.24 TFLOPS。但性能仍然很低：内层每做 1 次 FMA 要读 2 次共享内存，计算访存比只有 1:2，共享内存读延迟没有被任何计算掩盖。
 
-### 阶段三：线程粗化（GEMM3、GEMM4）
+<br>
+
+## 阶段三：线程粗化（GEMM3、GEMM4）
 
 思路是让一个线程算多个输出，读进寄存器的数据被多次复用。
 
@@ -192,7 +217,9 @@ GEMM12 在此基础上把 thread tile 放大到 16×8（每线程 128 个累加�
 2. **Loop 2**：每个线程沿 BK（dotIdx）循环，把 `As`、`Bs` 从共享内存搬到寄存器；
 3. **Loop 3 & 4**：寄存器里的标量进入 CUDA Core 做外积累加（FMA）。
 
-### 阶段四：寄存器复用（GEMM5）
+<br>
+
+## 阶段四：寄存器复用（GEMM5）
 
 GEMM4 的内层循环里，同一个 B 值在 i 循环中被重复读了 8 次。把 B 的一行先读进 `b_val[TN]` 寄存器，后续 FMA 全部用寄存器，共享内存访问次数减半。
 
@@ -215,7 +242,9 @@ for (int k = 0; k < BK; k++) {
 
 GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器），本质都是把数据往快层搬。本机性能与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS），因为此时瓶颈已转向全局访存的指令数，但这一版确定了后续所有 kernel 的内层结构。
 
-### 阶段五：float4 向量化（GEMM6、GEMM6B）
+<br>
+
+## 阶段五：float4 向量化（GEMM6、GEMM6B）
 
 此前全局到共享的搬运按单个 float 进行，一条 LDG 指令搬 4 字节。`float4` 一条指令搬 16 字节（LDG.128），同样数据的加载指令数降到 1/4。
 
@@ -249,9 +278,9 @@ for (int k = 0; k < BK; k++) {
 }
 ```
 
+<br>
 
-
-### 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
+## 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
 共享内存分成 32 个 bank，每周期每个 bank 只能服务一个地址。warp 内的多个线程访问同一个 bank，硬件就把请求串行化，即 bank conflict。
 
@@ -309,7 +338,9 @@ auto swizzle = [](int n, int k) {
 
 加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
 
-### 阶段七：双缓冲与软件流水（GEMM9、GEMM9B、GEMM10、GEMM10B）
+<br>
+
+## 阶段七：双缓冲与软件流水（GEMM9、GEMM9B、GEMM10、GEMM10B）
 
 分块后的每个 tile 要经历"加载 → 同步 → 计算 → 同步"，加载和计算严格串行。流水线的目标是让加载下一块和计算当前块重叠。
 
@@ -383,9 +414,9 @@ commit_b_store(next_buf);   // B 的转置+swizzle 落共享
 #endif
 ```
 
+<br>
 
-
-### 阶段八：两级流水线（GEMM11、GEMM11B）
+## 阶段八：两级流水线（GEMM11、GEMM11B）
 
 GEMM10 只把"全局→共享"做成流水，"共享→寄存器"仍然与 FMA 串行，BK=32 时共享内存读延迟累积 32 次。GEMM11 把寄存器 fragment 也开双缓冲，流水线扩成三级：
 
@@ -427,9 +458,9 @@ commit_a_store(next_buf);
 #endif
 ```
 
+<br>
 
-
-### 阶段九：分块形状调参（GEMM12）
+## 阶段九：分块形状调参（GEMM12）
 
 在本机上重新选择分块形状：BK 32→16、TM 8→16、TN 保持 8、线程 256→128。
 
