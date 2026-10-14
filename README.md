@@ -31,13 +31,17 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 
 ### GPU 的存储层级
 
-CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。所有 GEMM 优化做的事，概括起来就是把数据从下层搬到上层，并在上层反复使用。
+CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。
+
+所有 GEMM 优化做的事，概括起来就是把数据从下层搬到上层，并在上层反复使用。
 
 ![GPU 存储层级](images/sib_18_memory_hierarchy.png)
 
 ### 线程层级：Grid、Block、Thread
 
-一个 kernel 启动后，GPU 上的线程组织成三级结构。计算 C 矩阵时，Grid 内所有 block 铺满整个 C，每个 block 负责一个 tile，block 内每个线程再负责 tile 中的一个元素/一小块。
+一个 kernel 启动后，GPU 上的线程组织成三级结构。
+
+计算 C 矩阵时，Grid 内所有 block 铺满整个 C，每个 block 负责一个 tile，block 内每个线程再负责 tile 中的一个元素/一小块。
 
 ![线程层级](images/sib_01_thread_hierarchy.png)
 
