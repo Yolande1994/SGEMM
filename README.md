@@ -27,7 +27,7 @@ CUDA Event 计时，重复 100 次取平均值与中位数、交替采样、奇�
 
 同一台机器上分别用 `-arch=native` 和 `-arch=sm_80` 各实测一次，不同编译器调度的测试结果略有不同，但总体趋势一致。
 
-RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%，均稳定超过 cuBLAS FP32。
+RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：在 2048、3072、4096、5120、6144 五个尺寸上，GEMM12 分别达到 cuBLAS 的 115%、119%、110%、116%、115%。
 
 **性能总览（-arch=native）：**
 
@@ -99,7 +99,7 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。
 
 ---
 
-## 阶段一：朴素版（GEMM1）
+## GEMM1：朴素版
 
 一个线程负责一个输出元素 `C[row][col]`，沿 K 串行读取 A 的一行和 B 的一列做点积。
 
@@ -126,11 +126,19 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 
 <br>
 
-## 阶段二：共享内存分块（GEMM2）
+## GEMM2：共享内存分块
+
+**GEMM1** 的问题在于"同一个数据被不同线程反复从全局内存读取"。
 
 一个 32×32 的输出 tile 里，所有线程合起来只用到 32 行 A 和 32 列 B。
 
-先把这两块数据搬到共享内存，块内线程再从共享内存读，A 的每个元素在共享内存中被 32 个线程共用，B 同理，不需再访问 32 次全局内存，全局访存量降到约 1/32。
+可以先把这两块数据搬到共享内存，块内线程再从共享内存读，A 的每个元素在共享内存中被 32 个线程共用，B 同理。
+
+**实现：**
+
+把 A、B 各切分成 32x32 的小块（tile）。
+
+每次循环加载一个 tile 到 shared memory，然后块内所有线程从shared memory 里读取，共同计算对应的 32x32 输出。
 
 ![GEMM2](images/GEMM2.png)
 
@@ -143,7 +151,8 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
     int ty = threadIdx.y, tx = threadIdx.x;
     int row = blockIdx.y * BM + ty;
     int col = blockIdx.x * BN + tx;
-    float sum = 0.0f;  // 每线程 1 个输出的累加器
+    // 每线程 1 个输出的累加器
+    float sum = 0.0f;
     // 还是沿公共维度，但每次跨步 BK=32
     for (int tile = 0; tile < K; tile += BK) {
         // 协作加载 A 子块到共享内存
@@ -161,6 +170,14 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
     if (row < M && col < N) C[row * N + col] = sum;
 }
 ```
+
+**收益：**
+
+A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元素被 tx 方向的 32 个线程共用。
+
+这样就不用频繁访问全局内存，全局访存量从 O(M*N*K) 降到 O(M*N*K/32)，减少 32 倍。
+
+减少了最最耗时的全局内存访问，把访问地址转移到延迟低得多的 shared memory。
 
 ![共享内存分块](images/sib_04_cache_blocking.png)
 
