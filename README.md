@@ -1,6 +1,5 @@
 <div align="center">
   <h1>CUDA SGEMM 教学</h1>
-  <p>从朴素 Kernel 到反超 cuBLAS</p>
 
   <img src="https://img.shields.io/badge/CUDA-12.x-76b900" alt="CUDA">
   <img src="https://img.shields.io/badge/Precision-FP32-3b82f6" alt="Precision">
@@ -10,7 +9,9 @@
   <img src="https://img.shields.io/badge/License-MIT-9ca3af" alt="License">
 </div>
 
-从朴素 Kernel 到反超 cuBLAS，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
+从朴素 Kernel 到反超 cuBLAS，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状。最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
+
+<br>
 
 ## 测试环境
 
