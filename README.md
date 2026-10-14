@@ -56,6 +56,7 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 | GEMM14 | cuBLASLt (FP32) | 库自动选 kernel | 工业上限对照 | 14.46 | 9.50 | 96.5% |
 
 <br>
+
 ---
 
 ## 预备知识
@@ -77,6 +78,7 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。
 ![线程层级](images/sib_01_thread_hierarchy.png)
 
 <br>
+
 ---
 
 ## 优化路线逐版本讲解
