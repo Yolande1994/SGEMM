@@ -1,11 +1,14 @@
-<h1 align="center">CUDA SGEMM 教学</h1>
+<div align="center">
+  <h1>CUDA SGEMM 教学</h1>
+  <p>从朴素 Kernel 到反超 cuBLAS</p>
 
-![CUDA](https://img.shields.io/badge/CUDA-12.x-76b900)
-![Precision](https://img.shields.io/badge/Precision-FP32-3b82f6)
-![Arch](https://img.shields.io/badge/Arch-sm__120%20%7C%20sm__80-6b7280)
-![GPU](https://img.shields.io/badge/GPU-RTX%205060%20Laptop-76b900)
-![Kernels](https://img.shields.io/badge/Kernels-17%20%2B%202%20%E5%9F%BA%E5%87%86-111827)
-![License](https://img.shields.io/badge/License-MIT-9ca3af)
+  <img src="https://img.shields.io/badge/CUDA-12.x-76b900" alt="CUDA">
+  <img src="https://img.shields.io/badge/Precision-FP32-3b82f6" alt="Precision">
+  <img src="https://img.shields.io/badge/Arch-sm__120%20%7C%20sm__80-6b7280" alt="Arch">
+  <img src="https://img.shields.io/badge/GPU-RTX%205060%20Laptop-76b900" alt="GPU">
+  <img src="https://img.shields.io/badge/Kernels-17%20%2B%202%20%E5%9F%BA%E5%87%86-111827" alt="Kernels">
+  <img src="https://img.shields.io/badge/License-MIT-9ca3af" alt="License">
+</div>
 
 从朴素 Kernel 到反超 cuBLAS，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
 
