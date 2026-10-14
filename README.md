@@ -1,4 +1,4 @@
-# CUDA SGEMM 教学
+# CUDA SGEMM 教学 #
 
 ![CUDA](https://img.shields.io/badge/CUDA-12.x-76b900)
 ![Precision](https://img.shields.io/badge/Precision-FP32-3b82f6)
@@ -24,6 +24,32 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 **性能总览（-arch=sm_80）：**
 
 ![性能总览 sm_80](images/perf_sm80.png)
+
+### 4096 尺寸完整性能表（-arch=native）
+
+主性能图只收录 11 个代表性版本，这里列出全部 19 个（全尺寸全版本数据见 [test/benchmark_native.txt](test/benchmark_native.txt) 与 [test/benchmark_sm80.txt](test/benchmark_sm80.txt)）：
+
+| 版本 | 名称 | 配置 | 解决瓶颈 | 耗时 (ms) | TFLOPS | 占 cuBLAS |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| GEMM1 | 朴素移植 | block 32×32，一线程一元素 | — | 188.49 | 0.73 | 7.4% |
+| GEMM2 | 共享内存分块 | BM=BN=BK=32 | 全局访存量 O(MNK) | 110.52 | 1.24 | 12.6% |
+| GEMM3 | 一维线程粗化 | TM=8，block 32×16 | 计算访存比| 36.54 | 3.76 | 38.2% |
+| GEMM4 | 二维线程粗化 | TM=TN=8，block 16×16 | N 方向未复用 | 21.25 | 6.47 | 65.7% |
+| GEMM5 | 寄存器复用 | 同上 | SMEM 元素被重复读 8 次 | 21.00 | 6.55 | 66.5% |
+| GEMM6 | float4 访存向量化 | 128-bit LDG/STG | 访存指令数过多 | 20.88 | 6.58 | 66.8% |
+| GEMM6B | float4 计算向量化 | 128-bit LDS | 计算阶段 LDS 指令数 | 18.58 | 7.40 | 75.1% |
+| GEMM7 | bank 冲突反例 | Bds[BN][BK] | 刻意展示的反面教材 | 42.32 | 3.25 | 33.0% |
+| GEMM7B | k_offset 旋转 | 同上 | 计算阶段冲突 | 21.29 | 6.46 | 65.6% |
+| GEMM8 | XOR Swizzle | float4 粒度 | 加载+计算两处冲突 | 16.27 | 8.45 | 85.8% |
+| GEMM9 | 朴素双缓冲 | 动态 SMEM 64 KB | 加载与计算串行 | 20.59 | 6.68 | 67.8% |
+| GEMM9B | cp.async 双缓冲 | A 侧 DMA，B 侧同步 | 软件预取占发射槽 | 20.46 | 6.72 | 68.2% |
+| GEMM10 | 寄存器流水 | issue/commit 拆分 | 双缓冲没有形成流水 | 17.79 | 7.73 | 78.5% |
+| GEMM10B | 混合流水 | 同上 | A 侧预取白占寄存器 | 16.82 | 8.17 | 83.0% |
+| GEMM11 | 两级双缓冲 | 转置布局 [BK][BM] | SMEM→寄存器读延迟 | 17.80 | 7.72 | 78.4% |
+| GEMM11B | 两级 + cp.async | wait_group 0 | B 侧加载指令可省 | 16.39 | 8.39 | 85.2% |
+| GEMM12 | 自定义分块 | BK=16, TM=16, TN=8, 128 线程 | 分块/寄存器/占用率平衡 | 12.67 | 10.85 | 110.2% |
+| GEMM13 | cuBLAS (FP32) | 库自动选 kernel | 工业上限对照 | 13.96 | 9.85 | 100.0% |
+| GEMM14 | cuBLASLt (FP32) | 库自动选 kernel | 工业上限对照 | 14.46 | 9.50 | 96.5% |
 
 ---
 
