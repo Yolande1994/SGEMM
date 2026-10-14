@@ -31,7 +31,9 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 
 ### 4096 尺寸完整性能表（-arch=native）
 
-主性能图只收录 11 个代表性版本，这里列出全部 19 个（全尺寸全版本数据见 [test/benchmark_native.txt](test/benchmark_native.txt) 与 [test/benchmark_sm80.txt](test/benchmark_sm80.txt)）：
+主性能图只收录 11 个代表性版本，这里列出全部 19 个:
+
+>全尺寸全版本数据见 [test/benchmark_native.txt](test/benchmark_native.txt) 与 [test/benchmark_sm80.txt](test/benchmark_sm80.txt)
 
 | 版本 | 名称 | 配置 | 解决瓶颈 | 耗时 (ms) | TFLOPS | 占 cuBLAS |
 | --- | --- | --- | --- | ---: | ---: | ---: |
