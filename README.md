@@ -1,4 +1,4 @@
-# CUDA SGEMM 手写优化：从朴素 Kernel 到反超 cuBLAS
+# CUDA SGEMM 教学
 
 ![CUDA](https://img.shields.io/badge/CUDA-12.x-76b900)
 ![Precision](https://img.shields.io/badge/Precision-FP32-3b82f6)
@@ -7,7 +7,7 @@
 ![Kernels](https://img.shields.io/badge/Kernels-17%20%2B%202%20%E5%9F%BA%E5%87%86-111827)
 ![License](https://img.shields.io/badge/License-MIT-9ca3af)
 
-从 CPU 三重循环的朴素 GPU 移植出发，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
+从朴素 Kernel 到反超 cuBLAS，经过 12 个优化版本（共 17 个手写 kernel），包含共享内存分块、线程粗化、寄存器缓存、float4 向量化、XOR Swizzle、双缓冲、cp.async、寄存器软件流水、两级流水线、自定义分块形状，最终在多数矩阵尺寸上跑赢 cuBLAS FP32。
 
 ## 测试环境
 
