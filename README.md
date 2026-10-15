@@ -37,7 +37,7 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 
 ![性能总览 sm_80](images/perf_sm80.png)
 
-### 4096 尺寸完整性能表（-arch=native）
+### 完整性能表（4096 尺寸，-arch=native）
 
 主性能图只收录 11 个代表性版本，这里列出全部 19 个:
 
@@ -64,6 +64,10 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 | GEMM12 | 自定义分块 | BK=16, TM=16, TN=8, 128 线程 | 分块/寄存器/占用率平衡 | 12.67 | 10.85 | 110.2% |
 | GEMM13 | cuBLAS (FP32) | 库自动选 kernel | 工业上限对照 | 13.96 | 9.85 | 100.0% |
 | GEMM14 | cuBLASLt (FP32) | 库自动选 kernel | 工业上限对照 | 14.46 | 9.50 | 96.5% |
+
+### ncu 性能表（4096 尺寸，-arch=native）
+
+![NCU 数据](images/GEMM_ncu.png)
 
 <br>
 
