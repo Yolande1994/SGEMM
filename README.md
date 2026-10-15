@@ -218,13 +218,13 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 ## GEMM3：一维线程粗化（TM=8）
 
-![一维线程粗化](images/GEMM3.png)
-
 **说明**：
 
 - 每线程沿 M 方向负责 TM=8 个输出元素；B 值读 1 次、被 8 个累加器共享（参与 8 次 FMA）
 - 每个内层 k 迭代：读 8 个 A + 1 个 B，做 8 次 FMA，计算访存比从 1:2 升到 8:9；
 - block 改为 32×16=512 线程，覆盖 128×32 的输出 tile；warp 的 32 个线程恰好覆盖 BN=32 列，B 的读取天然合并。
+
+![一维线程粗化](images/GEMM3.png)
 
 ```cpp
 __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, int K) {
@@ -281,15 +281,15 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 
 ## GEMM4：二维线程粗化（TM=TN=8）
 
-GEMM3 只粗化了 M 方向：B 值读 1 次、被 TM 个累加器共享；但 A 值每个只参与 1 次 FMA，N 方向没有任何复用，共享内存访问量仍然偏高。所以这版对 N 方向也进行粗化。
-
-![二维线程粗化](images/GEMM4.png)
+**GEMM3** 只粗化了 M 方向：B 值读 1 次、被 TM 个累加器共享；但 A 值每个只参与 1 次 FMA，N 方向没有任何复用，共享内存访问量仍然偏高。所以这版对 N 方向也进行粗化。
 
 **说明**：
 
 - 两个方向同时粗化：每线程负责 TM×TN=64 个输出，设置一个二维形状的累加器；
 - 每个内层 k 迭代：读 8 个 A + 8 个 B，做 64 次 FMA，计算访存比 64:16 = 4:1，比 GEMM3 的 8:9 进一步提升，计算单元被喂得更饱；
 - block 改为 16×16=256 线程，覆盖 128×128 的输出 tile，全局内存访存量减少至 1/128，进一步降低。
+
+![二维线程粗化](images/GEMM4.png)
 
 ```cpp
 __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, int K) {
