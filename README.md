@@ -206,31 +206,22 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 <br>
 
-## 阶段三：线程粗化（GEMM3、GEMM4）
+### 阶段三：线程粗化（GEMM3、GEMM4）
 
-**遗留问题**：GEMM2 虽然把全局访存量从 O(MNK) 压到了 O(MN)，但每线程仍只算 1 个输出元素。内层 k 循环里每做 1 次 FMA 要读 2 次共享内存（Ads 和 Bds 各 1 次），计算访存比是 1:2——浮点单元每工作 1 拍就要等 2 次访存，大量空闲。
+**GEMM2** 虽然优化了全局访存量，但每线程仍只算 1 个输出元素。内层 k 循环里每做 1 次 FMA 要读 2 次共享内存（Ads 和 Bds 各 1 次），计算访存比是 1:2，浮点单元每工作 1 拍就要等 2 次访存，大量空闲。
 
-**本阶段的思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，每次访存换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续所有优化的地基。
+**本阶段思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，每次访存换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续优化的地基。
 
-### GEMM3：一维线程粗化（TM=8）
+## GEMM3：一维线程粗化（TM=8）
 
-**要解决的问题**：计算访存比 1:2 太低，SM 的浮点单元喂不饱。
+![一维线程粗化](images/GEMM3.png)
 
-**优化原理**：
+**说明**：
 
 - 每线程沿 M 方向负责 TM=8 个输出元素，A 值读进寄存器 1 次、被 8 个累加器共享；
 - B 值读 1 次，参与 8 次 FMA；
-- 每个内层 k 迭代：读 8 个 A + 1 个 B，做 8 次 FMA，计算访存比升到 8:9；
+- 每个内层 k 迭代：读 8 个 A + 1 个 B，做 8 次 FMA，计算访存比从 1:2 升到 8:9；
 - block 改为 32×16=512 线程，覆盖 128×32 的输出 tile；warp 的 32 个线程恰好覆盖 BN=32 列，B 的读取天然合并。
-
-**如何实现**：
-
-- 线程块布局 block(32, 16)：`tx` 覆盖 BN=32 列，`ty` 覆盖 BM/TM=16 个行组；
-- 每线程持有 8 个寄存器累加器 `float val[TM]`；
-- 加载阶段沿用 GEMM2 的步长循环（一维 `tid` 索引），由 512 个线程协作填满 Ads/Bds，全局读取天然合并；
-- 计算阶段：`b_val = Bds[k][tx]` 读 1 次，内层 i 循环里对 8 个累加器复用。
-
-![一维线程粗化](images/GEMM3.png)
 
 ```cpp
 __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, int K) {
@@ -240,6 +231,7 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
     __shared__ float Bds[BK][BN];
     int ty = threadIdx.y, tx = threadIdx.x;
     int tid = ty * blockDim.x + tx;
+
     // 每线程的 TM=8 个寄存器累加器
     float val[TM] = {0.0f};
 
@@ -271,13 +263,9 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
+<br>
 
-
-一维粗化让 A 值在寄存器里被 8 个累加器共享，计算访存比从 1:2 提到 8:9，是本路线里提速幅度最大的一步（native 下 3.02×，sm_80 下 2.72×）。
-
-**代价**：每线程 8 个累加器加寻址变量，寄存器压力上升（NCU 实测 47 个/线程），occupancy 略有下降。
-
-### GEMM4：二维线程粗化（TM=TN=8）
+## GEMM4：二维线程粗化（TM=TN=8）
 
 <table>
 <thead>
