@@ -65,7 +65,7 @@ RTX 5060 Laptop GPU（Blackwell，sm_120）`-arch=native`，中位数耗时：�
 | GEMM13 | cuBLAS (FP32) | 官方库上限对照 | 13.96 | 9.85 | 100.0% |
 | GEMM14 | cuBLASLt (FP32) | 官方库上限对照 | 14.46 | 9.50 | 96.5% |
 
-### ncu 性能表（4096 尺寸，-arch=native）
+### NCU 性能表（4096 尺寸，-arch=native）
 
 ![NCU 数据](images/GEMM_ncu.png)
 
@@ -99,7 +99,7 @@ CUDA kernel 能用的存储分四层，越往上越快、越小、越私有。
 
 计算 `C = A @ B`，`A (M,K)`、`B (K,N)`、`C (M,N)` ，均为行主序。
 
-下文代码片段是核心逻辑，完整实现见 [GEMM.cu](GEMM.cu) 中对应函数。
+下文代码片段按核心逻辑摘选而出，完整代码见 [GEMM.cu](GEMM.cu) 文件。
 
 ---
 
@@ -208,11 +208,76 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 ## 阶段三：线程粗化（GEMM3、GEMM4）
 
-思路是让一个线程算多个输出，读进寄存器的数据被多次复用。
+**遗留问题**：GEMM2 虽然把全局访存量从 O(MNK) 压到了 O(MN)，但每线程仍只算 1 个输出元素。内层 k 循环里每做 1 次 FMA 要读 2 次共享内存（Ads 和 Bds 各 1 次），计算访存比是 1:2——浮点单元每工作 1 拍就要等 2 次访存，大量空闲。
 
-**GEMM3 一维粗化**：每线程沿 M 方向负责 TM=8 个结果，block 扩到 32×16 共 512 线程，覆盖 128×32 的输出 tile。一个 warp 32 个线程恰好覆盖 BN=32 列，每个线程持 8 个累加器。每个内层 k 迭代读 8 个 A、1 个 B，做 8 次 FMA，计算访存比从 1:2 升到 8:9。
+**本阶段的思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，每次访存换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续所有优化的地基。
+
+### GEMM3：一维线程粗化（TM=8）
+
+**要解决的问题**：计算访存比 1:2 太低，SM 的浮点单元喂不饱。
+
+**优化原理**：
+
+- 每线程沿 M 方向负责 TM=8 个输出元素，A 值读进寄存器 1 次、被 8 个累加器共享；
+- B 值读 1 次，参与 8 次 FMA；
+- 每个内层 k 迭代：读 8 个 A + 1 个 B，做 8 次 FMA，计算访存比升到 8:9；
+- block 改为 32×16=512 线程，覆盖 128×32 的输出 tile；warp 的 32 个线程恰好覆盖 BN=32 列，B 的读取天然合并。
+
+**如何实现**：
+
+- 线程块布局 block(32, 16)：`tx` 覆盖 BN=32 列，`ty` 覆盖 BM/TM=16 个行组；
+- 每线程持有 8 个寄存器累加器 `float val[TM]`；
+- 加载阶段沿用 GEMM2 的步长循环（一维 `tid` 索引），由 512 个线程协作填满 Ads/Bds，全局读取天然合并；
+- 计算阶段：`b_val = Bds[k][tx]` 读 1 次，内层 i 循环里对 8 个累加器复用。
 
 ![一维线程粗化](images/GEMM3.png)
+
+```cpp
+__global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, int K) {
+    // TM=8 是本版的核心配置：每线程负责 8 行输出（一维粗化）
+    constexpr int BK = 32, BM = 128, BN = 32, TM = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    // 每线程的 TM=8 个寄存器累加器
+    float val[TM] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        // 步长循环加载 A tile：每个线程加载多个元素
+        for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
+            int m = i / BK, k = i % BK;
+            Ads[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        // 步长循环加载 B tile
+        for (int i = tid; i < BK * BN; i += blockDim.x * blockDim.y) {
+            int k = i / BN, n = i % BN;
+            Bds[k][n] = B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+        __syncthreads();
+
+        // 一维粗化：每线程沿 M 方向累加 TM 个输出，Bds 只读一次，复用 TM 次
+        for (int k = 0; k < BK; k++) {
+            float b_val = Bds[k][tx];
+            for (int i = 0; i < TM; i++)
+                val[i] += Ads[ty * TM + i][k] * b_val;
+        }
+        __syncthreads();
+    }
+
+    // 每线程沿 M 方向写入 TM 个输出
+    for (int i = 0; i < TM; i++)
+        C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx] = val[i];
+}
+```
+
+
+
+一维粗化让 A 值在寄存器里被 8 个累加器共享，计算访存比从 1:2 提到 8:9，是本路线里提速幅度最大的一步（native 下 3.02×，sm_80 下 2.72×）。
+
+**代价**：每线程 8 个累加器加寻址变量，寄存器压力上升（NCU 实测 47 个/线程），occupancy 略有下降。
+
+### GEMM4：二维线程粗化（TM=TN=8）
 
 <table>
 <thead>
@@ -224,11 +289,67 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 <tr><td>GEMM3</td><td align="right">36.54</td><td align="right">3.76</td><td align="right">38.2%</td><td align="right">39.77</td><td align="right">3.46</td><td align="right">36.0%</td></tr>
 </tbody>
 </table>
-一维粗化让 A 值在寄存器里被 8 个累加器共享，计算访存比从 1:2 提到 8:9，是路线里提速幅度最大的一步。
 
-**GEMM4 二维粗化**：N 方向同样复用。每线程负责 8×8 共 64 个结果，block 缩回 16×16 共 256 线程，覆盖 128×128 的 tile。每个 k 迭代读 8 个 A、8 个 B，做 64 次 FMA，计算访存比 64:16。
+**要解决的问题**：GEMM3 只粗化了 M 方向，B 值读进寄存器 1 次只用 1 次；N 方向的复用没有利用起来，共享内存访问量仍然偏高。
+
+**优化原理**：
+
+- 两个方向同时粗化：每线程负责 TM×TN=64 个输出，64 个寄存器累加器；
+- 每个内层 k 迭代：读 8 个 A + 8 个 B，做 64 次 FMA，计算访存比 64:16 = 4:1，比 GEMM3 的 8:9 再提 3 倍多；
+- block 改为 16×16=256 线程，覆盖 128×128 的输出 tile。
+
+**如何实现**：
+
+- 累加器变为二维 `float val[TM][TN]`；
+- 计算阶段是三重循环：外层 k，内层 i（M 方向）、j（N 方向），`val[i][j] += Ads[ty*TM+i][k] * Bds[k][tx*TN+j]`；
+- 写回阶段沿 M、N 两个方向铺开 64 个元素。
 
 ![二维线程粗化](images/sib_06_2d_blocktiling.png)
+
+```cpp
+__global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, int K) {
+    // 从一维粗化扩展到二维：TM=TN=8，每线程负责 64 个输出
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    // 每线程的 TM×TN=64 个寄存器累加器
+    float val[TM][TN] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        // 加载 A tile
+        for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
+            int m = i / BK, k = i % BK;
+            Ads[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        // 加载 B tile
+        for (int i = tid; i < BK * BN; i += blockDim.x * blockDim.y) {
+            int k = i / BN, n = i % BN;
+            Bds[k][n] = B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+        __syncthreads();
+
+        // 二维粗化计算：充分利用 64 个寄存器累加器
+        for (int k = 0; k < BK; k++)
+            for (int i = 0; i < TM; i++)
+                for (int j = 0; j < TN; j++)
+                    val[i][j] += Ads[ty * TM + i][k] * Bds[k][tx * TN + j];
+        __syncthreads();
+    }
+
+    // 每线程沿 M、N 两个方向写入 TM×TN 个输出
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j++)
+            C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = val[i][j];
+}
+```
+
+
+
+native 下二维粗化收益明显（1.72×）；sm_80 下反而略降（0.97×）。GEMM4 把大量寻址计算交给编译器排布，两个后端指令调度和寄存器分配的结果不同，性能就此分叉——这是第一次出现明显的编译目标分歧，之后还会反复遇到。
+
+**代价**：64 个累加器加寻址临时变量，单线程寄存器接近 100 个，occupancy 开始下降。TM=TN=8 是常用平衡点，再放大收益递减。
 
 <table>
 <thead>
@@ -240,68 +361,111 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 <tr><td>GEMM4</td><td align="right">21.25</td><td align="right">6.47</td><td align="right">65.7%</td><td align="right">40.91</td><td align="right">3.36</td><td align="right">35.0%</td></tr>
 </tbody>
 </table>
-native 下二维粗化收益明显；sm_80 下反而略降，属于编译器调度差异——GEMM4 把大量寻址交给编译器排布，不同后端指令调度结果差异被放大，这是第一次出现明显的编译目标分歧。
 
-**协作加载**：块内线程把自己铺平成一维，用步长循环把整块 `As`、`Bs` 填满。加载行横跨 BK，warp 内 32 个线程访问连续地址，天然满足合并访存；行与行之间按线程数跨步。
+### 协作加载（cooperative loading）
+
+上面的 GEMM3/GEMM4 都用同一个技巧把全局数据搬进共享内存：把 (m, k) 二维索引展开成一维 `i`，用整个 block 的线程步长循环协作填充——每个线程搬 4~8 个 float4，全局内存按行连续读取，天然合并（coalesced）。这就是协作加载：
 
 ```cpp
-for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
-    int m = i / BK;
-    int k = i % BK;
-    As[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
+// BM×BK 的 A 分块，由 block 内全部线程步长协作搬入共享内存
+for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+    int m = i / (BK / 4), k = (i %% (BK / 4)) * 4;   // 一维 i → 二维 (m, k)
+    *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
 }
 ```
 
-![协作加载](images/sib_07_gmem_loading.png)
-
-GEMM3、GEMM4 在 4096 尺寸分别为 3.76、6.47 TFLOPS。代价是寄存器：64 个累加器加寻址变量，单线程寄存器接近 100 个，占用率开始下降。
+它保证两件事：**每个线程连续搬 4 个 float（一条 float4 指令）**，且 **warp 内相邻线程访问全局内存相邻地址（合并访问）**。之后所有版本的加载都沿用这个写法。
 
 ### 三级 Tiling 总览
 
-GEMM4 之后的版本采用统一的三级划分：
-
-- Grid 按 128×128 的 block tile 铺满 C：`grid = (N/128, M/128)`；
-- 每个 block 16×16 共 256 个线程，协作计算一个 128×128 的 block tile；
-- 每个线程负责一个 8×8 的 thread tile，持有 64 个累加器；
-- K 方向每次推进 BK=32。
-
-GEMM12 在此基础上把 thread tile 放大到 16×8（每线程 128 个累加器）、线程数降到 128、BK 收到 16。
+到这里，GEMM2→GEMM3→GEMM4 完成了三层 Tiling 的完整骨架。一张图看懂分块结构：
 
 ![三级 Tiling](images/sib_19_tiling_overview.png)
 
+- **输出分块**：grid 划分输出 C，一个 block 负责 BM×BN=128×128；
+- **线程分块**：block 内 256 个线程，每线程负责 TM×TN=8×8=64 个输出（寄存器）；
+- **K 分块**：一次搬 BK=32 行 k 进共享内存，K 方向循环 128 次（4096/32）。
+
 ### 三层循环对应三级存储
 
-分块后的 kernel 是三层嵌套循环，每深入一层，数据就向计算单元靠近一级：
+主循环天然对应三层存储，这是后续一切优化的坐标系：
 
-![三层循环与三级存储](images/sib_13_loop_structure.png)
+![三层循环](images/sib_13_loop_structure.png)
 
-1. **Loop 1**：每个 block 沿 K 循环，把 `As`、`Bs` 从全局内存搬到共享内存；
-2. **Loop 2**：每个线程沿 BK（dotIdx）循环，把 `As`、`Bs` 从共享内存搬到寄存器；
-3. **Loop 3 & 4**：寄存器里的标量进入 CUDA Core 做外积累加（FMA）。
+| 循环 | 对应存储 | 数据复用 | 数据量 |
+| --- | --- | --- | --- |
+| tile 循环（K 方向） | 全局内存 ↔ 共享内存 | 每个 tile 读一次 | BM×BK + BK×BN |
+| k 内层循环（BK 方向） | 共享内存 ↔ 寄存器 | 每行 k 读一次 | TM + TN |
+| i/j 内层循环（TM/TN） | 寄存器 ↔ FMA | 寄存器内复用 | 0（不访存） |
+
+三层循环的每一层都对应一次"把数据从慢层级搬到快层级、然后重复使用"的动作。优化就是逐层提高复用次数、降低访存次数。
 
 <br>
 
 ## 阶段四：寄存器复用（GEMM5）
 
-GEMM4 的内层循环里，同一个 B 值在 i 循环中被重复读了 8 次。把 B 的一行先读进 `b_val[TN]` 寄存器，后续 FMA 全部用寄存器，共享内存访问次数减半。
+**要解决的问题**：GEMM4 的内层三重循环里，同一个 B 值在 i 循环中被重复读了 8 次（每读一次做 1 次 FMA）；同一个 A 值在 j 循环中也被重复读了 8 次。64 次 FMA 对应 64 次共享内存读，共享内存被反复访问。
+
+**优化原理**：
+
+- 把 B 的 TN 个值一次性读进寄存器数组 `b_val[TN]`，再对每个 i 读一次 A、用寄存器里的 b_val 做 TN 次 FMA；
+- 共享内存访问次数：Bds 从 TM×TN 降到 TN，Ads 从 TM×TN 降到 TM；TM=TN=8 时从 64 次降到 16 次，降 4 倍；
+- 本质与 GEMM2 是同一个动作：把数据从慢层级搬到快层级反复使用。GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器）。寄存器比共享内存更快、又不占带宽，是更彻底的复用。
+
+**如何实现**：
+
+- 内层 k 循环改成两段：先 `for (j) b_val[j] = Bds[k][tx*TN+j]` 把 B 读进寄存器；再 `for (i) for (j) val[i][j] += a_val * b_val[j]` 纯寄存器 FMA；
+- A 值每次读一个标量 `Ads[ty*TM+i][k]` 进寄存器，被 8 个 b_val 复用。
+
+![寄存器复用](images/sib_08_reg_blocking.png)
 
 ```cpp
-for (int k = 0; k < BK; k++) {
-    float b_val[TN];
-    for (int j = 0; j < TN; j++)
-        b_val[j] = Bds[k][tx * TN + j];    // 先读进寄存器
-    for (int i = 0; i < TM; i++) {
-        float a_val = Ads[ty * TM + i][k];
-        for (int j = 0; j < TN; j++)
-            val[i][j] += a_val * b_val[j]; // 后续全部用寄存器
+__global__ void GEMM5(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    // 每线程的 TM×TN=64 个寄存器累加器（与 GEMM4 相同）
+    float val[TM][TN] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
+            int m = i / BK, k = i % BK;
+            Ads[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        for (int i = tid; i < BK * BN; i += blockDim.x * blockDim.y) {
+            int k = i / BN, n = i % BN;
+            Bds[k][n] = B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+        __syncthreads();
+
+        for (int k = 0; k < BK; k++) {
+            // 本版核心：先把 B 的 TN 个值读到寄存器，之后 TM×TN 次 FMA 都不再访问 Bds
+            float b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = Bds[k][tx * TN + j];
+            // 再读 A 的 TM 个值，做 TM*TN 次 FMA
+            for (int i = 0; i < TM; i++) {
+                float a_val = Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j++)
+                    val[i][j] += a_val * b_val[j];
+            }
+        }
+        __syncthreads();
     }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j++)
+            C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = val[i][j];
 }
 ```
 
-每一步 dotIdx 把 A 的一列（regM）和 B 的一行（regN）读进寄存器，做一次外积，累加进 8×8 的结果矩阵。下图示意 2×2 粗化、4 步的过程。
 
-![寄存器外积](images/sib_08_reg_blocking.png)
 
+本机实测 GEMM5 与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS，native 下 1.01×；sm_80 下 0.97× 小幅回落）。诚实交代：此刻的瓶颈已转向全局访存指令数，共享内存带宽还没有成为瓶颈，寄存器复用的收益没有显现出来。这一版的价值是**确立了后续所有 kernel 的内层结构**——先读寄存器、再做 FMA，GEMM6 之后每一版都在这个结构上叠加新机制。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -312,25 +476,76 @@ for (int k = 0; k < BK; k++) {
 <tr><td>GEMM5</td><td align="right">21.00</td><td align="right">6.55</td><td align="right">66.5%</td><td align="right">42.00</td><td align="right">3.27</td><td align="right">34.1%</td></tr>
 </tbody>
 </table>
-GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器），本质都是把数据往快层搬。本机性能与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS），因为此时瓶颈已转向全局访存的指令数，但这一版确定了后续所有 kernel 的内层结构。
-
-
-GEMM5 把共享内存访问次数从 64 次降到 16 次，但本机上 shared 带宽还不是瓶颈，所以性能几乎不变；它真正的价值是确立了后续所有 kernel 的内层结构（先读寄存器再算 FMA）。sm_80 下小幅回落同样是编译器调度差异。
-<br>
 
 ## 阶段五：float4 向量化（GEMM6、GEMM6B）
 
-此前全局到共享的搬运按单个 float 进行，一条 LDG 指令搬 4 字节。`float4` 一条指令搬 16 字节（LDG.128），同样数据的加载指令数降到 1/4。
+**遗留问题**：全局→共享的搬运按单个 float 进行，一条 LDG 指令只搬 4 字节。搬一个 tile 需要成千上万条访存指令，load/store 单元的发射压力很大，挤占了 FMA 的发射机会。
+
+**本阶段的思路**：用 `float4` 让一条指令搬 16 字节（硬件对应 LDG.128 / STG.128），搬同样数据量的指令数降到 1/4。前提是地址 16 字节对齐、且矩阵尺寸满足 BK、BN 能被 4 整除（本仓库都是 32 的倍数）。
+
+### GEMM6：全局访存 float4
+
+**要解决的问题**：全局加载和写回阶段指令数过多。
+
+**优化原理与实现**：
+
+- 加载循环按 float4 展开：`i` 遍历 float4 块，`k = (i % (BK/4)) * 4` 得到 float4 起始列号；
+- `*(float4*)&Ads[m][k] = *(const float4*)&A[...]`：一条指令搬 4 个 float；
+- C 写回也用 float4 打包：`float4 v = {val[i][j], ...}; *(float4*)&C[...] = v`；
+- 计算阶段保持 GEMM5 的标量寄存器结构，只动访存。
 
 ![float4 向量化](images/sib_10_float4.png)
 
 ```cpp
-// 全局 → 共享：一条 LDG.128 搬 4 个 float
-for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
-    int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
-    *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+__global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    float val[TM][TN] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        // 使用 float4 向量化加载 A，减少访存指令
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            // i 是 float4 的索引，k 是 float4 的起始列号，k 一定是 4 的倍数
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        // 使用 float4 向量化加载 B
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            *(float4*)&Bds[k][n] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+        __syncthreads();
+
+        for (int k = 0; k < BK; k++) {
+            float b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = Bds[k][tx * TN + j];
+            for (int i = 0; i < TM; i++) {
+                float a_val = Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j++)
+                    val[i][j] += a_val * b_val[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    // 使用 float4 向量化写回 C
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
 }
 ```
+
+
+
+native 下 float4 收益很小（1.01×）——native 后端自己就能把标量加载合并成向量指令；sm_80 后端下访存指令数直接减到 1/4，收益放大到 2.13×。同一份代码、两个编译目标表现天差地别，这是编译目标影响性能的第一个明显案例。
+
+### GEMM6B：计算阶段 float4
 
 <table>
 <thead>
@@ -342,29 +557,68 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 <tr><td>GEMM6</td><td align="right">20.88</td><td align="right">6.58</td><td align="right">66.8%</td><td align="right">19.67</td><td align="right">6.99</td><td align="right">72.8%</td></tr>
 </tbody>
 </table>
-前提是地址 16 字节对齐、K 与 N 能被 4 整除（矩阵按 16 对齐分配）。GEMM6 的 A、B 加载和 C 写回都用 float4。GEMM6B 进一步把计算阶段读 Bds 也改为 float4（Ads 沿行跨 BK 不连续，无法向量化），再带来约 2%~12% 收益。4096 尺寸 GEMM6 为 6.58 TFLOPS、GEMM6B 为 7.40 TFLOPS。
 
+**要解决的问题**：GEMM6 只向量化了访存阶段，计算阶段读 Bds 仍是标量（一条 LDS 读 4 字节），指令数依旧偏多。
 
-native 下 float4 收益很小，因为 native 后端本身已把标量加载合并得不错；sm_80 后端下访存指令数直接减到 1/4，收益被放大到 2 倍多。同一份代码，两个编译目标的表现天差地别。
+**优化原理**：Bds 沿 k 方向连续，`Bds[k][tx*TN+j]` 里 j 是连续 4 个元素，可以用一条 float4 LDS 一次读入，计算阶段 LDS 指令数压到 1/4。
+Ads 不能这样：`Ads[ty*TM+i][k]` 中 i 是行方向，跨 BK=32 个步长不连续，无法用一条 float4 指令读取——这是后面阶段六要处理的引子。
+
+**如何实现**：
+
+- 用 `float4 b_val4[TN/4]`，每 4 个 j 一条 LDS；
+- FMA 拆成 .x/.y/.z/.w 四次累加，累加器仍是标量数组。
+
 ```cpp
-// GEMM6B 新增：计算阶段读 Bds 也改成 float4，LDS 指令数压到 1/4
-// （Ads 沿行跨 BK 不连续，无法向量化，保持标量读）
-for (int k = 0; k < BK; k++) {
-    float4 b_val4[TN / 4];
-    for (int j = 0; j < TN; j += 4)
-        b_val4[j / 4] = *(const float4*)&Bds[k][tx * TN + j];   // 4 个 float 一次读
-    for (int i = 0; i < TM; i++) {
-        float a_val = Ads[ty * TM + i][k];
-        for (int j = 0; j < TN; j += 4) {
-            val[i][j+0] += a_val * b_val4[j/4].x;
-            val[i][j+1] += a_val * b_val4[j/4].y;
-            val[i][j+2] += a_val * b_val4[j/4].z;
-            val[i][j+3] += a_val * b_val4[j/4].w;
+__global__ void GEMM6B(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    float val[TM][TN] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
         }
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            *(float4*)&Bds[k][n] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+        __syncthreads();
+
+        for (int k = 0; k < BK; k++) {
+            // B 侧每 4 个 j 用一条 float4 读取，把 LDS 指令数压到 1/4
+            float4 b_val4[TN / 4];
+            for (int j = 0; j < TN; j += 4)
+                b_val4[j / 4] = *(const float4*)&Bds[k][tx * TN + j];
+            for (int i = 0; i < TM; i++) {
+                float a_val = Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j += 4) {
+                    val[i][j + 0] += a_val * b_val4[j / 4].x;
+                    val[i][j + 1] += a_val * b_val4[j / 4].y;
+                    val[i][j + 2] += a_val * b_val4[j / 4].z;
+                    val[i][j + 3] += a_val * b_val4[j / 4].w;
+                }
+            }
+        }
+        __syncthreads();
     }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
 }
 ```
 
+
+
+native 下计算阶段 float4 带来 1.12×；sm_80 下没有收益（6.95 vs 6.99 TFLOPS，0.99×）——该后端的 LDS 调度已经足够紧凑。优化收益依赖编译目标，这是又一个例证。GEMM6B 之后性能进入平台期，真正的瓶颈已经转移到共享内存 bank 冲突上——下一阶段专门处理它。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -375,37 +629,87 @@ for (int k = 0; k < BK; k++) {
 <tr><td>GEMM6B</td><td align="right">18.58</td><td align="right">7.40</td><td align="right">75.1%</td><td align="right">19.78</td><td align="right">6.95</td><td align="right">72.4%</td></tr>
 </tbody>
 </table>
-native 下计算阶段 float4 带来 12% 提升；sm_80 下没有收益（6.95 vs 6.99），说明该后端的 LDS 调度已足够紧凑，这是优化收益依赖编译目标的又一例证。
-<br>
 
 ## 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
-共享内存分成 32 个 bank，每周期每个 bank 只能服务一个地址。warp 内的多个线程访问同一个 bank，硬件就把请求串行化，即 bank conflict。
+**背景知识（必须懂）**：共享内存被组织成 32 个 bank（32 条并行通道），bank 编号按"地址 % 32"计算。一个 warp 访问共享内存时，如果 32 个线程落在 32 个不同 bank，一次就能取完；如果有多个线程落在同一个 bank，硬件只能把它们串行化排队执行，叫 **bank conflict**。冲突路数 = 同一 bank 上的线程数，n 路冲突时吞吐量掉到理论值的 1/n。
 
-![Bank 冲突](images/sib_11_bank_conflict.png)
+![bank 冲突](images/sib_11_bank_conflict.png)
 
-**GEMM7 是刻意保留的反面教材**。为了让 A 侧也能 float4 读取，把 `Bds` 从 `[BK][BN]` 改成 `[BN][BK]` 转置布局。转置后同一列（k 相同、n 不同）的地址相差 BK=32，恰好是 bank 数的整数倍，warp 内 32 个线程的访问全部落到同一个 bank，产生 32-way 冲突。NCU 实测计算吞吐利用率掉到 20.7%，4096 耗时 42.32 ms，比 GEMM6 慢一倍。
+**引子**：GEMM6B 的 Ads 无法 float4（沿行跨 BK=32 不连续）。一个自然的想法：把 Bds 也转置成 `[BN][BK]`，让 Ads 和 Bds 都沿 k 连续，A 侧也能 float4——"一点收益也是收益"。GEMM7 试了这个改法，结果踩了大坑。
+
+### GEMM7：转置布局反例（刻意保留的负面教材）
+
+**做了什么**：B 在共享内存里改成 `[BN][BK]` 转置布局，加载 B 时全局按 n 方向连续读 float4，写入共享时转置。
+
+**为什么性能腰斩**：数组形状 [32][32] 时每行正好 32 个 float，同一列 k 的所有行落在同一个 bank：
+
+- **加载写入** `Bds[n][k]`：bank = k%32，warp 内所有线程的 k 相同 → 32 路冲突；
+- **计算读取** `Bds[tx*TN+j][k]`：bank = k%32，block 16×16 里 16 个不同行号的线程全堵在 bank k 上 → 16 路冲突；
+- NCU 实测计算吞吐利用率掉到 20.7%、显存吞吐 94%，SM 基本不计算，时间全耗在共享内存排队上。4096 尺寸耗时 42.32 ms，比 GEMM6B 慢一倍多。
+
+**教训**：bank conflict 是隐蔽的性能杀手。布局一改、bank 分布跟着变，就可能引入冲突——**改布局必须同时检查加载和计算两处访存**。
+
 ```cpp
-// GEMM7 的布局改动：B 转置成 [BN][BK]，沿 k 连续，计算阶段才能用 float4 读
-__shared__ float Bds[BN][BK];   // 不再是 [BK][BN]
+__global__ void GEMM7(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    // 本版核心：B 在 shared 里改成 [BN][BK] 布局，沿 k 方向连续，才能用 float4 读
+    // 代价是计算阶段会出现 bank conflict
+    __shared__ float Bds[BN][BK];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    float val[TM][TN] = {0.0f};
 
-// 加载：从全局读连续 n 方向的 float4，转置写入共享内存
-for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
-    int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
-    float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
-    Bds[n + 0][k] = v.x;  Bds[n + 1][k] = v.y;
-    Bds[n + 2][k] = v.z;  Bds[n + 3][k] = v.w;
-}
+    for (int tile = 0; tile < K; tile += BK) {
+        // A：直接 float4 加载到 Ads[BM][BK]
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        // B：从全局 B(K, N) 读取连续 n 方向的 float4，写入 shared 时转置为 Bds[BN][BK]
+        // 此处会产生 bank conflict（所有线程命中同一列 k）
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+            Bds[n + 0][k] = v.x;
+            Bds[n + 1][k] = v.y;
+            Bds[n + 2][k] = v.z;
+            Bds[n + 3][k] = v.w;
+        }
+        __syncthreads();
 
-// 计算：所有线程沿同一个 k 读 Bds[.][k]，落在同一 bank → 32-way 冲突
-for (int k = 0; k < BK; k += 4) {
-    float4 b_val[TN];
-    for (int j = 0; j < TN; j++)
-        b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
-    ...
+        // 朴素 k 访问：所有线程共同沿着 k=0 偏移，命中同一个 bank
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
 }
 ```
 
+
+
+GEMM7 是本仓库唯一的纯负面教材：性能比上一版腰斩（native 0.49×、sm_80 0.48×）。保留它是为了直观展示"为了一点收益乱改布局"的代价。
+
+### GEMM7B：k_offset 循环移位（只修好一半）
 
 <table>
 <thead>
@@ -417,19 +721,77 @@ for (int k = 0; k < BK; k += 4) {
 <tr><td>GEMM7</td><td align="right">42.32</td><td align="right">3.25</td><td align="right">33.0%</td><td align="right">42.86</td><td align="right">3.21</td><td align="right">33.4%</td></tr>
 </tbody>
 </table>
-转置布局的加载和计算阶段同时踩中 32/16 路 bank 冲突，把上一版辛苦积累的性能全部吐回去——这是整条路线里唯一一个纯负面教材，用来证明"布局改动必须同时检查两处访存"。
 
+**做了什么**：与 GEMM7 的唯一区别在计算循环的 k 起点——按线程编号旋转：
 
-**GEMM7B** 用 `k_offset = tid*4` 循环移位，让不同线程从不同的 k 开始访问，把计算阶段的冲突降到 2-way；但加载阶段的 32-way 转置写入冲突没有处理，性能回到 6.46 TFLOPS，仍不如 GEMM6。
 ```cpp
-// GEMM7B 与 GEMM7 唯一区别：k 的起点按线程编号旋转
-// 线程 tid 从 k = tid*4 开始，绕一圈回到起点，warp 内 32 个线程的起始 k 各不相同
 for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
-    int k = k_offset % BK;   // 访问被打散到不同 bank
+    int k = k_offset % BK;   // 不同线程从不同 k 开始，绕一圈回起点
     ...
 }
 ```
 
+warp 内 32 个线程起始 k 各不相同，访问分散到不同 bank，计算阶段冲突从 16 路降到 2 路。
+
+**为什么仍不快**：k_offset 只解决了计算阶段。加载阶段转置写入 `Bds[BN][BK]` 的代码一字未改，warp 内所有线程仍在写同一列 k，仍是 32 路冲突。治标不治本，整体性能 6.46 TFLOPS，还是不如 GEMM6B。
+
+```cpp
+__global__ void GEMM7B(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    __shared__ float Bds[BN][BK];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    float val[TM][TN] = {0.0f};
+
+    for (int tile = 0; tile < K; tile += BK) {
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+            Bds[n + 0][k] = v.x;
+            Bds[n + 1][k] = v.y;
+            Bds[n + 2][k] = v.z;
+            Bds[n + 3][k] = v.w;
+        }
+        __syncthreads();
+
+        // 本版核心：k_offset 旋转，不同线程从不同 k 开始，打散 bank
+        // 与 GEMM7 唯一区别就在这一行 k 的起点，其他完全相同
+        for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
+            int k = k_offset % BK;
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
+}
+```
+
+
+
+k_offset 把计算阶段修复后性能从 3.25 提到 6.46 TFLOPS（1.99×/1.97×），但加载阶段的 32 路冲突还在，仍低于 GEMM6B 的 7.40。下一步要把两处冲突一次解决。
+
+### GEMM8：XOR Swizzle（一次解决两处冲突）
 
 <table>
 <thead>
@@ -441,23 +803,97 @@ for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
 <tr><td>GEMM7B</td><td align="right">21.29</td><td align="right">6.46</td><td align="right">65.6%</td><td align="right">21.79</td><td align="right">6.31</td><td align="right">65.7%</td></tr>
 </tbody>
 </table>
-k_offset 旋转只修好了计算阶段的冲突，加载阶段的 32-way 转置写入冲突还在，性能只恢复到 GEMM6B 之前，说明"治标不治本"。
 
-
-**GEMM8 用 XOR Swizzle 一次性解决两处冲突**。不改变存储大小，只把行号的几个位异或进列地址，让同一列在不同行落到不同 bank；float4 粒度保持，对齐不受影响。
+**优化原理**：不改变物理存储大小，通过按位异或把"行号的一部分位"混入"列地址"，让相同列 k 在不同行 n 上落到不同的 bank：
 
 ```cpp
-// swizzle(n,k) = ((k>>2) ^ ((n>>3) & 7)) << 2 | (k & 3)
 auto swizzle = [](int n, int k) {
-    int c   = k / 4;              // 第几个 float4 块
-    int off = k % 4;              // 块内偏移
-    int sc  = c ^ ((n / 8) % 8);  // 行号特征混入列块号
-    return sc * 4 + off;
+    int c   = k / 4;                // 第几个 float4 块（0~7）
+    int off = k % 4;                // float4 块内偏移
+    int sc  = c ^ ((n / 8) % 8);    // 行号特征混入列块号
+    return sc * 4 + off;            // 拼回最终列号，仍是 4 的倍数
 };
 ```
 
+拆解：`k>>2` 把列号按 float4 分块；`(n>>3)&7` 提取行号高 3 位、区分不同线程的行区间；异或把行号特征混进列块索引，相同列在不同行映射到不同 bank；`<<2 | (k&3)` 还原列地址并保留块内偏移，float4 对齐不被破坏。
+
+**效果**：加载阶段 32 路 → 4 路，计算阶段 16 路 → 2 路，且保留 float4 指令优势。对比 GEMM6：加载持平、B 计算从 4 路降到 2 路，全面更优。
+与 k_offset 的关系：k_offset 只解决计算阶段；swizzle 让相同 k 在不同 n 落到不同 bank，加载和计算两处同时解决。本版删除 k_offset，改回普通 `k = 0~BK` 循环。
+
 ![XOR Swizzle](images/sib_12_swizzle.png)
 
+```cpp
+__global__ void GEMM8(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    __shared__ float Ads[BM][BK];
+    // 保持 [BN][BK] 布局，计算阶段才能用 float4 读连续 k
+    __shared__ float Bds[BN][BK];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+
+    // 本版核心：XOR Swizzle 地址映射，以 float4 为粒度，不破坏对齐
+    // 输入：n 行号（BN 方向），k 列号（BK 方向，4 的倍数）
+    // 输出：搅乱后的新列号，仍是 4 的倍数，float4 读取仍对齐
+    auto swizzle = [](int n, int k) {
+        int c   = k / 4;                // 算k在第几个 float4 块里
+        int off = k % 4;                // 算k在块里是第几个元素
+        int sc  = c ^ ((n / 8) % 8);   // 用行号把列块号搅乱
+        return sc * 4 + off;            // 拼回最终的列号
+    };
+
+    float val[TM][TN] = {0.0f};
+    for (int tile = 0; tile < K; tile += BK) {
+        // A：float4 加载到 Ads[BM][BK]，无 swizzle
+        // 加载阶段为 4-way 冲突，但相比 B 侧的 32-way 风险可控，且计算阶段只有 2-way，加 swizzle 会破坏计算阶段的 float4 连续读取。还收益小，不额外引入 swizzle
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        // B：全局读 float4（n 方向连续），写入 shared 时转置为 Bds[BN][BK]
+        // 写入地址套上 swizzle，把原来 32-way 的转置写入冲突降到 4-way
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+            // 因为 n..n+3 的 (n+d)>>3 相同，swizzle 值一样，只算一次
+            int s = swizzle(n, k);
+            Bds[n + 0][s] = v.x;
+            Bds[n + 1][s] = v.y;
+            Bds[n + 2][s] = v.z;
+            Bds[n + 3][s] = v.w;
+        }
+        __syncthreads();
+
+        // 计算阶段：本版删除 k_offset，改回普通 k = 0~BK 遍历（swizzle 已经让相同 k 在不同 n 上落到不同 bank，不需要旋转 k 起点）
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[tx * TN + j][swizzle(tx * TN + j, k)];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
+}
+```
+
+
+
+加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。XOR Swizzle 是解决 bank 冲突的通用方案，后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -468,37 +904,111 @@ auto swizzle = [](int n, int k) {
 <tr><td>GEMM8</td><td align="right">16.27</td><td align="right">8.45</td><td align="right">85.8%</td><td align="right">17.81</td><td align="right">7.72</td><td align="right">80.4%</td></tr>
 </tbody>
 </table>
-加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
-
-
-XOR Swizzle 把两处冲突一起解决，不仅恢复还超过了 GEMM6B，是解决 bank 冲突的通用方案。
-<br>
 
 ## 阶段七：双缓冲与软件流水（GEMM9、GEMM9B、GEMM10、GEMM10B）
 
-分块后的每个 tile 要经历"加载 → 同步 → 计算 → 同步"，加载和计算严格串行。流水线的目标是让加载下一块和计算当前块重叠。
+**遗留问题**：到目前为止，每个 tile 的处理都是"加载 → 同步 → 计算 → 同步"，加载和计算严格串行——SM 在加载时计算闲置、在计算时内存闲置。硬件的加载单元和计算单元本来是独立的，把它们的工作错开，就能让两边同时忙碌。
 
-**GEMM9 朴素双缓冲**。开两份共享内存 `[2][BM][BK]`，计算当前块的同时预取下一块，交替使用（ping-pong）。共享内存翻倍到 64 KB，需要用 `cudaFuncSetAttribute` 提高单 block 动态共享内存上限。
+### GEMM9：朴素双缓冲（负优化反例）
+
+**做了什么**：共享内存开两份 buffer（`Ads[2][BM][BK]`、`Bds[2][BN][BK]`）。处理 tile t 时用 buf_0 计算、同时把 tile t+1 加载进 buf_1，下一轮互换，两份 buffer 交替使用（ping-pong）。共享内存翻倍到 64 KB，需要用 `cudaFuncSetAttribute` 提高单 block 动态共享内存上限。
+
+**为什么反而变慢**：加载下一 tile 的整段代码排在计算前面，LDG 一口气全发、STS 跟着全写完，warp 才进入计算。编译器找不到"加载与计算交错"的调度点：
+
+- LDG 的数百周期延迟没有被任何计算覆盖——双缓冲开了，却没有形成流水；
+- 共享内存翻倍到 64 KB，occupancy 被拉低。
+
+这是"写了双缓冲不等于有流水线"的典型案例。
+
+![双缓冲](images/sib_14_double_buffer.png)
+
 ```cpp
-// GEMM9：动态共享内存 64 KB，开两份 buffer（ping-pong）
-extern __shared__ char smem[];
-auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
-auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
-// launch 前必须提高单 block 动态共享内存上限
-cudaFuncSetAttribute(GEMM9, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+__global__ void GEMM9(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    // shared memory 开两份 buffer，这是本版核心：
+    // Ads/Bds 的第一维大小 2 是双缓冲 buffer 维度
+    auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    auto swizzle = [](int n, int k) {
+        int c   = k >> 2;
+        int off = k & 3;
+        int sc  = c ^ ((n >> 3) & 7);
+        return (sc << 2) | off;
+    };
+    float val[TM][TN] = {0.0f};
+    int buf = 0;  // 当前计算用的 buffer 索引，加载下一 tile 时切换到另一个
 
-// 主循环：先把下一 tile 预取进 next_buf，再计算当前 buf
-for (int tile = 0; tile < K; tile += BK) {
-    if (next_tile < K) {
-        // LDG + 转置 STS 写进 Ads[next_buf] / Bds[next_buf]
+    // 预加载 tile 0 到 buf 0
+    for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+        int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+        *(float4*)&Ads[0][m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + k];
     }
-    /* 计算 Ads[buf] / Bds[buf] 的 FMA */
+    for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+        int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+        float4 v = *(const float4*)&B[k * N + blockIdx.x * BN + n];
+        int s = swizzle(n, k);
+        Bds[0][n + 0][s] = v.x;
+        Bds[0][n + 1][s] = v.y;
+        Bds[0][n + 2][s] = v.z;
+        Bds[0][n + 3][s] = v.w;
+    }
     __syncthreads();
-    buf = next_buf;   // 切换 buffer
+
+    // 主循环：预加载下一 tile，计算当前 tile
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        // 加载下一 tile 到 next_buf
+        if (next_tile < K) {
+            for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+                int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+                *(float4*)&Ads[next_buf][m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + next_tile + k];
+            }
+            for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+                int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+                float4 v = *(const float4*)&B[(next_tile + k) * N + blockIdx.x * BN + n];
+                int s = swizzle(n, k);
+                Bds[next_buf][n + 0][s] = v.x;
+                Bds[next_buf][n + 1][s] = v.y;
+                Bds[next_buf][n + 2][s] = v.z;
+                Bds[next_buf][n + 3][s] = v.w;
+            }
+        }
+        // 计算当前 buf
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[buf][tx * TN + j][swizzle(tx * TN + j, k)];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[buf][ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        __syncthreads();
+        buf = next_buf;  // 切换 buffer，下一轮用刚加载好的那份
+    }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
 }
 ```
 
-![双缓冲](images/sib_14_double_buffer.png)
+
+
+诚实交代：这一版是负优化。4096 尺寸 native 6.68 TFLOPS（0.79×）、sm_80 4.77 TFLOPS（0.62×）——预取整段排在计算前面，LDG 延迟没被覆盖，64 KB 共享内存还压低了占用率。这正是 GEMM10 要解决的问题。
+
+### GEMM9B：cp.async 双缓冲
 
 <table>
 <thead>
@@ -510,21 +1020,109 @@ for (int tile = 0; tile < K; tile += BK) {
 <tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
 </tbody>
 </table>
-但这一版实测 6.68 TFLOPS，没有比 GEMM8 快。原因是加载下一 tile 的代码整段排在计算前面，LDG 一次性发完、STS 全部写完才进入计算，编译器找不到交错调度点，双缓冲开了却没有形成流水。这是"写了双缓冲不等于有流水线"的典型案例。
 
+**背景**：cp.async 是 sm_80 引入的异步拷贝指令，一条指令把数据从全局内存直接搬进共享内存，**不经过寄存器、不占用 warp 发射槽**——warp 发完立即返回，DMA 引擎在后台搬运，搬运和计算是真正的并行。
 
-诚实交代：这一版是负优化。双缓冲的代码写了，但"预取整段排在计算前面"导致 LDG 延迟没有被覆盖，编译器也找不到交错点；64 KB 共享内存还压低了占用率。这是"写了双缓冲不等于有流水线"的典型反例，也是后面 GEMM10 要解决的问题。
+同步机制 `commit_group` / `wait_group`：指令发出 ≠ 数据到位，需要用"组"管理流水进度：
 
-**GEMM9B 用 cp.async**。cp.async 是 sm_80 引入的异步拷贝指令，由 DMA 引擎把数据从全局内存直接搬进共享内存，不经过寄存器、不占用线程发射槽；用 `commit_group` / `wait_group` 管理进度。
+```cpp
+cp.async.commit_group;    // 把已发出的拷贝打包成一组
+cp.async.wait_group N;    // 最多允许 N 组还没完成，其余组必须完成
+```
+
+循环里为什么用 `wait_group 1`：处理 tile 时流水里恰好有两组在飞——本轮刚提交的 next tile（允许没搬完，后台继续）和上一轮提交的 current tile（必须已就绪，马上要算）。`wait_group 1` 的含义就是"第 2 组必须完成，第 1 组可以没完成"。
+
+**为什么只有半流水**：B 需要转置 + swizzle 才能写进共享内存，而 cp.async 只能做直线拷贝，所以 B 仍走"LDG 到寄存器再 STS 写入"的普通路径，真正异步的只有 A。。
 
 ![cp.async](images/sib_15_cp_async.png)
 
 ```cpp
-asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
-    : : "l"(&Ads[b][m][k]), "l"(&A[...]) : "memory");
-asm volatile("cp.async.commit_group;" ::: "memory");
-asm volatile("cp.async.wait_group 1;" ::: "memory");
+__global__ void GEMM9B(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    // 双缓冲 shared memory（架构与 GEMM9 相同）
+    auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    auto swizzle = [](int n, int k) {
+        int c   = k >> 2;
+        int off = k & 3;
+        int sc  = c ^ ((n >> 3) & 7);
+        return (sc << 2) | off;
+    };
+    float val[TM][TN] = {0.0f};
+    int buf = 0;  // 当前计算用的 buffer 索引，加载下一 tile 时切换到另一个
+    // 本版核心：用 cp.async 发出下一 tile 的加载，异步 DMA，不占 warp 指令发射
+    auto load_tile_async = [&](int b, int tile) {  // b 是 buffer（0/1），tile 是 K 段
+        // A 可以用 cp.async 直接拷贝
+        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
+            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                : : "l"(&Ads[b][m][k]), "l"(&A[(blockIdx.y * BM + m) * K + tile + k]) : "memory");
+        }
+        // B 无法用 cp.async 直接转置，用普通 float4 加载 + 共享内存写入转置
+        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
+            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
+            float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+            int s = swizzle(n, k);
+            Bds[b][n + 0][s] = v.x;
+            Bds[b][n + 1][s] = v.y;
+            Bds[b][n + 2][s] = v.z;
+            Bds[b][n + 3][s] = v.w;
+        }
+    };
+    // 预加载 tile 0 并等待它到位
+    load_tile_async(0, 0);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+
+    // 主循环：预加载下一 tile，计算当前 tile
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        // 发出下一 tile 的异步拷贝，并提交为一组
+        if (next_tile < K) {
+            load_tile_async(next_buf, next_tile);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+        if (next_tile < K)
+            asm volatile("cp.async.wait_group 1;" ::: "memory");  // wait_group 1：允许最新的 1 组（next tile）还没完成，前面的组必须完成
+        else
+            asm volatile("cp.async.wait_group 0;" ::: "memory");  // 最后一轮全等
+        __syncthreads();
+        // 计算当前 buf
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[buf][tx * TN + j][swizzle(tx * TN + j, k)];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[buf][ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        __syncthreads();
+        buf = next_buf;
+    }
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
+}
 ```
+
+
+
+cp.async 把 A 侧的加载交给 DMA 引擎。native 下收益很小（1.01×）——软件预取被编译器优化得已经不错；sm_80 下 DMA 的异步优势才真正显现（1.22×）。优化手段的价值同样取决于编译目标。
+
+### GEMM10：寄存器软件流水（全流水）
 
 <table>
 <thead>
@@ -536,21 +1134,122 @@ asm volatile("cp.async.wait_group 1;" ::: "memory");
 <tr><td>GEMM9B</td><td align="right">20.46</td><td align="right">6.72</td><td align="right">68.2%</td><td align="right">23.57</td><td align="right">5.83</td><td align="right">60.8%</td></tr>
 </tbody>
 </table>
-由于 B 需要转置加 swizzle，cp.async 只能做直线拷贝，本版只有 A 侧真正异步（半流水），性能 6.72 TFLOPS。架构低于 sm_80 时通过 `#if __CUDA_ARCH__ >= 800` 自动回退到软件加载。
 
+**要解决的问题**：GEMM9B 只有 A 侧真正异步。不引入新硬件，能不能靠指令调度让 A、B 两侧的加载都真正重叠？
 
-cp.async 把 A 侧的加载交给 DMA 引擎。native 下收益很小，因为软件预取被编译器优化得已经不错；sm_80 下 DMA 的异步优势才真正显现——优化手段的价值同样取决于编译目标。
+**优化原理**：利用硬件 scoreboard 机制——**写寄存器不阻塞，只有读它的时候才隐式等待**。把"加载 next tile"拆成两个动作，中间插入计算：
 
-**GEMM10 寄存器软件流水**。不依赖新硬件，靠指令调度让加载与计算真正重叠。把加载拆成两个动作，中间插入计算：
+1. **issue_load**：只发 LDG 把数据读进预取寄存器，不等待返回，warp 立即继续；
+2. **计算 current tile 的全部 FMA**：LDG 的数百周期延迟被这段计算盖住；
+3. **commit_store**：把预取寄存器 STS 落进共享内存，此刻才隐式等待未到的数据。
+
+A、B 两侧都走这条路，是全流水；每线程多持有 8 个 float4 预取寄存器（约 32 个寄存器）。
+
+![寄存器流水](images/sib_16_register_pipeline.png)
 
 ```cpp
-// 1. issue_load：只发 LDG 到预取寄存器，不等待返回，warp 继续往下走
-// 2. 计算当前 tile 的全部 FMA（LDG 的数百周期延迟被这段计算盖住）
-// 3. commit_store：把预取寄存器 STS 落进共享内存，此刻才隐式等待未到的数据
-if (next_tile < K) issue_load(a_next, b_next, next_tile);
-/* ... 计算 current tile ... */
-if (next_tile < K) commit_store(a_next, b_next, next_buf);
+__global__ void GEMM10(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    auto swizzle = [](int n, int k) {
+        int c   = k >> 2;
+        int off = k & 3;
+        int sc  = c ^ ((n >> 3) & 7);
+        return (sc << 2) | off;
+    };
+    float val[TM][TN] = {0.0f};
+    int buf = 0;
+
+    // 动作一：只发 LDG（数据进寄存器，不等！warp 立即继续）
+    // 每线程 4+4 条 LDG（tile 大小 = BM×BK = 128×32 = 4096个 float = 1024个 float4，一个 block 共256个线程，每线程加载 1024/256 = 4个 float4）
+    auto issue_load = [&](float4* a_reg, float4* b_reg, int tile) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            a_reg[i] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            b_reg[i] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+    };
+    // 动作二：把寄存器数据落入共享（消费 LDG，这里才等；B 含转置 + swizzle）
+    auto commit_store = [&](const float4* a_reg, const float4* b_reg, int b) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            *(float4*)&Ads[b][m][k] = a_reg[i];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            float4 v = b_reg[i];
+            int s = swizzle(n, k);
+            Bds[b][n + 0][s] = v.x;
+            Bds[b][n + 1][s] = v.y;
+            Bds[b][n + 2][s] = v.z;
+            Bds[b][n + 3][s] = v.w;
+        }
+    };
+
+    // 预加载 tile 0：LDG 发出 → 落入共享（首次等待不可避免，一次性成本）
+    float4 a_reg[4], b_reg[4];
+    issue_load(a_reg, b_reg, 0);
+    commit_store(a_reg, b_reg, 0);
+    __syncthreads();
+
+    // 主循环：发 next tile 的 LDG → 计算 current tile → next tile 落共享
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        float4 a_next[4], b_next[4];
+        // 1.提前发 next 的 LDG（不等，数据在途，warp 继续往下走）
+        if (next_tile < K)
+            issue_load(a_next, b_next, next_tile);
+        // 2. 计算 current（LDG 延迟在此被覆盖）
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[buf][tx * TN + j][swizzle(tx * TN + j, k)];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[buf][ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        // 3. next 落共享（LDG 大概率已到；未到则只补等剩余延迟）
+        if (next_tile < K)
+            commit_store(a_next, b_next, next_buf);
+        __syncthreads();
+        buf = next_buf;  // 翻转 buffer，下一轮用刚加载好的那份
+    }
+
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
+}
 ```
+
+
+
+把"加载"拆成 issue（发 LDG 不等）和 commit（消费时才等），中间填 FMA，双缓冲才真正流起来。4096 尺寸 native 下 7.73 TFLOPS（1.16×），sm_80 下 7.17 TFLOPS（1.50×）——sm_80 后端不会自动做这种调度，显式排布的收益被放大。
+
+### GEMM10B：混合流水（cp.async A + 寄存器预取 B）
 
 <table>
 <thead>
@@ -562,18 +1261,10 @@ if (next_tile < K) commit_store(a_next, b_next, next_buf);
 <tr><td>GEMM10</td><td align="right">17.79</td><td align="right">7.73</td><td align="right">78.5%</td><td align="right">19.17</td><td align="right">7.17</td><td align="right">74.7%</td></tr>
 </tbody>
 </table>
-利用的是硬件 scoreboard 机制：写寄存器不阻塞，只有读它的时候才等待。A、B 两路都走这条路，是全流水；每线程多持有 8 个 float4 预取寄存器。
 
-![寄存器流水](images/sib_16_register_pipeline.png)
+**做了什么**：A 不需要转置，改用 cp.async 直拷（DMA 后台搬运、不占寄存器，省掉 4 个 float4 预取寄存器）；B 仍要转置 + swizzle，保留寄存器预取。寄存器占用从 155 降到 141。
 
-4096 尺寸 native 下 7.73 TFLOPS，比 GEMM9 快 14%；`-arch=sm_80` 下快 34%，显式调度的优势被放大。
-
-
-把"加载"拆成 issue（发 LDG 不等）和 commit（消费时才等），中间填 FMA，这才让双缓冲真正流起来。sm_80 后端不会自动做这种调度，显式排布的收益被放大。
-
-**GEMM10B 混合流水**：A 不需要转置，改用 cp.async 直拷，省 4 个 float4 预取寄存器；B 保留寄存器预取。4096 尺寸 8.17 TFLOPS，寄存器从 155 降到 141。
 ```cpp
-#if __CUDA_ARCH__ >= 800
 // A：发 cp.async 直拷（DMA 后台搬运，不占寄存器）
 issue_a_copy(next_buf, next_tile);
 // B：仍走 LDG 到预取寄存器（需要转置+swizzle，cp.async 搬不了）
@@ -582,10 +1273,116 @@ asm volatile("cp.async.commit_group;" ::: "memory");
 asm volatile("cp.async.wait_group 1;" ::: "memory");  // 只等 current 到位，next 继续飞
 /* ... 计算 current（B 的 LDG 延迟被 FMA 盖住）... */
 commit_b_store(next_buf);   // B 的转置+swizzle 落共享
-#endif
+```
+
+```cpp
+__global__ void GEMM10B(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    auto& Ads = *reinterpret_cast<float (*)[2][BM][BK]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BN][BK]>(smem + 2 * BM * BK * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    auto swizzle = [](int n, int k) {
+        int c   = k >> 2;
+        int off = k & 3;
+        int sc  = c ^ ((n >> 3) & 7);
+        return (sc << 2) | off;
+    };
+    float val[TM][TN] = {0.0f};
+    int buf = 0;
+    constexpr int PER_THREAD = BK * (BN / 4) / 256;  // 每线程负责的 float4 数量
+    float4 b_reg[PER_THREAD];  // B 的预取寄存器
+
+    // B：只发 LDG 到寄存器（不等，warp 立即继续）
+    auto issue_b_load = [&](int tile) {
+        #pragma unroll
+        for (int i = 0; i < PER_THREAD; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            b_reg[i] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+    };
+    // B：把寄存器数据转置+swizzle 落共享
+    auto commit_b_store = [&](int b) {
+        #pragma unroll
+        for (int i = 0; i < PER_THREAD; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            float4 v = b_reg[i];
+            int s = swizzle(n, k);
+            Bds[b][n + 0][s] = v.x;
+            Bds[b][n + 1][s] = v.y;
+            Bds[b][n + 2][s] = v.z;
+            Bds[b][n + 3][s] = v.w;
+        }
+    };
+
+    // A：发 cp.async 直拷（硬件 DMA，不占寄存器，也不等）
+    auto issue_a_copy = [&](int b, int tile) {
+        #pragma unroll
+        for (int i = 0; i < PER_THREAD; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                : : "l"(&Ads[b][m][k]), "l"(&A[(blockIdx.y * BM + m) * K + tile + k]) : "memory");
+        }
+    };
+    // 预加载 tile 0：发 A cp.async + B LDG→ 提交并全部等待→ B 落共享 （首次等待不可避免）
+    issue_a_copy(0, 0);
+    issue_b_load(0);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    commit_b_store(0);
+    __syncthreads();
+
+    // 主循环
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        // 1. 提前发 next 的 A cp.async + B LDG，提交 A 组并等待 current 到位
+        if (next_tile < K) {
+            issue_a_copy(next_buf, next_tile);
+            issue_b_load(next_tile);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 1;" ::: "memory");  // 允许 next 未完成，current 必须到位
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");  // 最后一轮：没有 next，等所有 A 组完成
+        }
+        // 2. 计算 current（B 的 LDG 延迟在此被覆盖）
+        for (int k = 0; k < BK; k += 4) {
+            float4 b_val[TN];
+            for (int j = 0; j < TN; j++)
+                b_val[j] = *(const float4*)&Bds[buf][tx * TN + j][swizzle(tx * TN + j, k)];
+            for (int i = 0; i < TM; i++) {
+                float4 a_val = *(const float4*)&Ads[buf][ty * TM + i][k];
+                for (int j = 0; j < TN; j++) {
+                    val[i][j] += a_val.x * b_val[j].x;
+                    val[i][j] += a_val.y * b_val[j].y;
+                    val[i][j] += a_val.z * b_val[j].z;
+                    val[i][j] += a_val.w * b_val[j].w;
+                }
+            }
+        }
+        // 3. B 转置 STS 落共享（next 的寄存器数据；A 的 DMA 已由循环开头的 wait 保证）
+        if (next_tile < K)
+            commit_b_store(next_buf);
+        __syncthreads();
+        buf = next_buf;
+    }
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+        }
+}
 ```
 
 
+
+A 改用 cp.async 省掉 4 个 float4 预取寄存器（155→141），两个编译目标下都有稳定提升（均 1.06×）——省下来的寄存器压力确实转化成了调度空间。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -596,12 +1393,12 @@ commit_b_store(next_buf);   // B 的转置+swizzle 落共享
 <tr><td>GEMM10B</td><td align="right">16.82</td><td align="right">8.17</td><td align="right">83.0%</td><td align="right">18.03</td><td align="right">7.62</td><td align="right">79.5%</td></tr>
 </tbody>
 </table>
-A 改用 cp.async 省掉 4 个 float4 预取寄存器（155→141），两个编译目标下都有稳定提升，说明省下来的寄存器压力确实转化成了调度空间。
-<br>
 
 ## 阶段八：两级流水线（GEMM11、GEMM11B）
 
-GEMM10 只把"全局→共享"做成流水，"共享→寄存器"仍然与 FMA 串行，BK=32 时共享内存读延迟累积 32 次。GEMM11 把寄存器 fragment 也开双缓冲，流水线扩成三级：
+**遗留问题**：GEMM10 只把"全局→共享"做成了流水，"共享→寄存器"仍然与 FMA 串行。BK=32 时内层每次 FMA 都要先等共享内存读取完成，读延迟累积 32 次。
+
+**本阶段的思路**：把寄存器 fragment 也开双缓冲，流水线扩成三级：
 
 ```
 全局内存 → 共享内存（第一级双缓冲）→ 寄存器 fragment（第二级双缓冲）→ FMA
@@ -609,7 +1406,16 @@ GEMM10 只把"全局→共享"做成流水，"共享→寄存器"仍然与 FMA �
 
 ![两级流水线](images/sib_17_two_stage_pipeline.png)
 
-共享内存布局改为转置的 `[BK][BM]` / `[BK][BN]`，让内层 fragment 固定 k、沿 M/N 方向连续读，支持 float4。每线程持 `a_frag[2]`、`b_frag[2]` 两份寄存器片段，边预取下一排边做当前排的 FMA。
+### GEMM11：SMEM + fragment 双缓冲
+
+**做了什么**：
+
+- 共享内存布局改为转置的 `[BK][BM]` / `[BK][BN]`：内层 fragment 固定 k、沿 M/N 方向连续读，支持 float4；
+- 每线程持 `a_frag[2][TM]`、`b_frag[2][TN]` 两份寄存器片段；
+- **第一层流水**（全局→共享）：沿用 GEMM10 的 issue/commit 风格；
+- **第二层流水**（共享→寄存器→FMA）：内层 bk 循环里 `issue_frag_load` 预取 bk+1 排（读共享、不等），`commit_frag_fma` 用 bk 排做 FMA（消费上一轮预取）。
+
+**如何实现**：两层流水嵌套在同一个 tile 主循环里。注意每次进入新 tile 时要手动预取第一个 fragment——流水线第一块数据总要手工放上去。
 
 ```cpp
 float a_frag[2][TM], b_frag[2][TN];
@@ -617,24 +1423,144 @@ for (int bk = 0; bk < BK - 1; bk++) {
     issue_frag_load(buf, bk);   // 预取 bk+1 排，不等
     commit_frag_fma(bk);        // 用 bk 排做 FMA，消费上一轮预取
 }
+commit_frag_fma(BK - 1);        // 最后一行没有下一排可预取，直接算
+```
+
+```cpp
+__global__ void GEMM11(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    // 共享内存双缓冲（第一层）：转置布局，方便寄存器 fragment 沿 BM/BN 方向连续读取
+    auto& Ads = *reinterpret_cast<float (*)[2][BK][BM]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BK][BN]>(smem + 2 * BK * BM * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    int tile_m = ty * TM, tile_n = tx * TN;  // 输出 tile 里的行起点、列起点
+    float val[TM][TN] = {0.0f};
+    int buf = 0;
+
+    // ------ 第一层流水：全局内存 → 共享内存（和 GEMM10 风格完全一致） ------
+    float4 ldg_a[4], ldg_b[4];  // 全局加载的中转寄存器（每线程 4+4 个 float4）
+    // 动作一：发全局 LDG（数据进中转寄存器，不等！warp 立即继续）
+    auto issue_gmem_load = [&](int tile) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            ldg_a[i] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            ldg_b[i] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
+        }
+    };
+    // 动作二：中转寄存器数据落共享（消费 LDG，这里才等；A 做转置写入）
+    auto commit_gmem_store = [&](int b) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            // 转置写入：A 全局 [BM][BK] → 共享 [BK][BM]，逐个分量写入完成转置
+            Ads[b][k + 0][m] = ldg_a[i].x;
+            Ads[b][k + 1][m] = ldg_a[i].y;
+            Ads[b][k + 2][m] = ldg_a[i].z;
+            Ads[b][k + 3][m] = ldg_a[i].w;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            // B 无需转置，直接 float4 写入共享 [BK][BN]
+            *(float4*)&Bds[b][k][n] = ldg_b[i];
+        }
+    };
+
+    // ------ 第二层流水：共享内存 → 寄存器 Fragment ------
+    float a_frag[2][TM], b_frag[2][TN];  // fragment 双缓冲（2 份，交替使用，float 数组）
+    // 动作一：发共享 LDG（数据进 fragment 寄存器，不等！）
+    auto issue_frag_load = [&](int b, int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m += 4)
+            // 读的是 bk+1（下一排）、写进 (bk+1)%2（另一份缓冲）—— 预取下一排用的数据
+            *(float4*)&a_frag[(bk + 1) % 2][m] = *(const float4*)&Ads[b][bk + 1][tile_m + m];
+        #pragma unroll
+        for (int n = 0; n < TN; n += 4)
+            *(float4*)&b_frag[(bk + 1) % 2][n] = *(const float4*)&Bds[b][bk + 1][tile_n + n];
+    };
+    // 动作二：用 fragment 数据做 FMA（消费 LDG，这里才等）
+    auto commit_frag_fma = [&](int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m++)
+            #pragma unroll
+            for (int n = 0; n < TN; n++)
+                // 用的是 bk%2（上一轮预取好的）
+                val[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+    };
+
+    // ------ 预加载：首次填充流水线 ------
+    // 从 gmem 预加载 tile 0 到 smem
+    issue_gmem_load(0);
+    commit_gmem_store(0);
+    __syncthreads();
+    // 从 smem 预加载 bk=0 的 fragment 到寄存器（这里手写而不调用 issue_frag_load 因为 issue_frag_load 读的是 bk+1(预取下一块)）
+    #pragma unroll
+    for (int m = 0; m < TM; m += 4)
+        *(float4*)&a_frag[0][m] = *(const float4*)&Ads[0][0][tile_m + m];
+    #pragma unroll
+    for (int n = 0; n < TN; n += 4)
+        *(float4*)&b_frag[0][n] = *(const float4*)&Bds[0][0][tile_n + n];
+
+    // ------ 主循环：两层流水嵌套 ------
+    for (int tile = 0; tile < K; tile += BK) {    // 外层循环（tile 级）：一次搬 32 行 k 的整块数据（tile），在 "全局→共享" 之间双缓冲交替
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        // 一层流水：提前发 next tile 的全局 LDG（不等，数据在途）
+        if (next_tile < K)
+            issue_gmem_load(next_tile);
+        // 二层流水：内层 bk 循环，fragment 级流水
+        #pragma unroll
+        for (int bk = 0; bk < BK - 1; bk++) {    // 内层循环（bk 级）：一次扫 1 行 k 的 fragment，在 "共享→寄存器" 之间双缓冲交替，边预取边算
+            issue_frag_load(buf, bk);  // 预取 bk+1 的 fragment（不等）
+            commit_frag_fma(bk);        // 计算 bk 的 FMA
+        }
+        commit_frag_fma(BK - 1);  // 最后一行 bk=31，没下一行可预取，直接算
+        // 一层流水：next tile 落共享内存
+        if (next_tile < K) {
+            commit_gmem_store(next_buf);
+            __syncthreads();
+            // 预取下一个 tile 的第一个 fragment，为下一轮外层循环做准备（流水线的第一块总要手动放上去）
+            #pragma unroll
+            for (int m = 0; m < TM; m += 4)
+                *(float4*)&a_frag[0][m] = *(const float4*)&Ads[next_buf][0][tile_m + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n += 4)
+                *(float4*)&b_frag[0][n] = *(const float4*)&Bds[next_buf][0][tile_n + n];
+        }
+        buf = next_buf;  // 翻转共享内存 buffer
+    }
+
+    // 写回输出
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + tile_m + i) * N + blockIdx.x * BN + tile_n + j] = v;
+        }
+}
 ```
 
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM10B</td><td align="right">16.82</td><td align="right">8.17</td><td align="right">83.0%</td><td align="right">18.03</td><td align="right">7.62</td><td align="right">79.5%</td></tr>
-<tr><td>GEMM11</td><td align="right">17.80</td><td align="right">7.72</td><td align="right">78.4%</td><td align="right">17.84</td><td align="right">7.71</td><td align="right">80.3%</td></tr>
-</tbody>
-</table>
-诚实交代：两级流水在本机没有带来提升，native 下反而略降——SMEM→寄存器的读延迟在 BK=32 时没有被充分暴露，第一级流水还叠加了转置布局的开销。两个编译目标结论相反，属于典型的编译器调度差异。它的意义在下一版（GEMM11B）才兑现。
 
-GEMM11B 中 B 的共享内存形状 `[BK][BN]` 与全局行主序完全对齐，不需要转置，B 路也换成 cp.async（`wait_group 0`），A 路保留软件转置。4096 尺寸 GEMM11 / GEMM11B 为 7.72 / 8.39 TFLOPS，NCU 显存吞吐从 46% 升到 83.5%。
+诚实交代：两级流水在本机没有带来提升，native 下反而略降（0.94×）——SMEM→寄存器的读延迟在 BK=32 时没有被充分暴露，第一级流水还叠加了转置布局的开销；sm_80 下微升（1.01×）。两个编译目标结论相反，属于典型的编译器调度差异。它的意义在下一版（GEMM11B）才兑现。
+
+### GEMM11B：B 侧走 cp.async
+
+**做了什么**：B 的共享内存形状 `[BK][BN]` 与全局行主序完全对齐，不需要转置，B 路换成 cp.async（`wait_group 0`），A 路保留软件转置。整条 B 路交给 DMA，代码只有 4 行。
+
 ```cpp
-#if __CUDA_ARCH__ >= 800
 // B 布局与全局对齐、无转置 → 整条 B 路交给 DMA，代码只有 4 行
 auto issue_b_copy = [&](int b, int tile) {
     for (int i = 0; i < 4; i++) {
@@ -651,10 +1577,131 @@ asm volatile("cp.async.commit_group;" ::: "memory");
 /* ... 内层 fragment 流水做完整块 FMA ... */
 asm volatile("cp.async.wait_group 0;" ::: "memory");  // B 全部到位再落 A
 commit_a_store(next_buf);
-#endif
+```
+
+```cpp
+__global__ void GEMM11B(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
+    extern __shared__ char smem[];
+    auto& Ads = *reinterpret_cast<float (*)[2][BK][BM]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BK][BN]>(smem + 2 * BK * BM * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    int tile_m = ty * TM, tile_n = tx * TN;
+    float val[TM][TN] = {0.0f};
+    int buf = 0;
+
+    // A 侧：软件 LDG 中转（需要转置，不能用 cp.async）
+    float4 ldg_a[4];
+    auto issue_a_load = [&](int tile) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            ldg_a[i] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+    };
+    auto commit_a_store = [&](int b) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            Ads[b][k + 0][m] = ldg_a[i].x;
+            Ads[b][k + 1][m] = ldg_a[i].y;
+            Ads[b][k + 2][m] = ldg_a[i].z;
+            Ads[b][k + 3][m] = ldg_a[i].w;
+        }
+    };
+
+    // 第二层流水：fragment 双缓冲（两条路径共用）
+    float a_frag[2][TM], b_frag[2][TN];
+    auto issue_frag_load = [&](int b, int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m += 4)
+            *(float4*)&a_frag[(bk + 1) % 2][m] = *(const float4*)&Ads[b][bk + 1][tile_m + m];
+        #pragma unroll
+        for (int n = 0; n < TN; n += 4)
+            *(float4*)&b_frag[(bk + 1) % 2][n] = *(const float4*)&Bds[b][bk + 1][tile_n + n];
+    };
+    auto commit_frag_fma = [&](int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m++)
+            #pragma unroll
+            for (int n = 0; n < TN; n++)
+                val[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+    };
+
+    // B 侧：cp.async 直拷（无转置，布局对齐）
+    auto issue_b_copy = [&](int b, int tile) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                : : "l"(&Bds[b][k][n]), "l"(&B[(tile + k) * N + blockIdx.x * BN + n]) : "memory");
+        }
+    };
+    // 预加载 tile 0：A LDG + B cp.async，提交并全部等待
+    issue_a_load(0);
+    issue_b_copy(0, 0);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    commit_a_store(0);
+    __syncthreads();
+    #pragma unroll
+    for (int m = 0; m < TM; m += 4)
+        *(float4*)&a_frag[0][m] = *(const float4*)&Ads[0][0][tile_m + m];
+    #pragma unroll
+    for (int n = 0; n < TN; n += 4)
+        *(float4*)&b_frag[0][n] = *(const float4*)&Bds[0][0][tile_n + n];
+    // 主循环
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        if (next_tile < K) {
+            issue_a_load(next_tile);
+            issue_b_copy(next_buf, next_tile);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+        // 内层 fragment 流水
+        #pragma unroll
+        for (int bk = 0; bk < BK - 1; bk++) {
+            issue_frag_load(buf, bk);
+            commit_frag_fma(bk);
+        }
+        commit_frag_fma(BK - 1);
+        if (next_tile < K) {
+            // 计算结束，等 B next 全部到位，再落 A next，并预取 fragment
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            commit_a_store(next_buf);
+            __syncthreads();
+            #pragma unroll
+            for (int m = 0; m < TM; m += 4)
+                *(float4*)&a_frag[0][m] = *(const float4*)&Ads[next_buf][0][tile_m + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n += 4)
+                *(float4*)&b_frag[0][n] = *(const float4*)&Bds[next_buf][0][tile_n + n];
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
+        buf = next_buf;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + tile_m + i) * N + blockIdx.x * BN + tile_n + j] = v;
+        }
+}
 ```
 
 
+
+B 布局与全局行主序对齐后改走 cp.async，省掉整条 B 路预取寄存器和转置指令，显存吞吐从 46% 升到 83.5%——上一版两级流水的铺垫在这里兑现（native 1.09×、sm_80 1.12×）。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -665,41 +1712,158 @@ commit_a_store(next_buf);
 <tr><td>GEMM11B</td><td align="right">16.39</td><td align="right">8.39</td><td align="right">85.2%</td><td align="right">15.95</td><td align="right">8.62</td><td align="right">89.8%</td></tr>
 </tbody>
 </table>
-B 布局与全局行主序对齐后改走 cp.async，省掉整条 B 路预取寄存器和转置指令，显存吞吐从 46% 升到 83.5%——上一版两级流水的铺垫在这里兑现。
-<br>
 
 ## 阶段九：分块形状调参（GEMM12）
 
-在本机上重新选择分块形状：BK 32→16、TM 8→16、TN 保持 8、线程 256→128。
+**要解决的问题**：两级流水、cp.async、swizzle、float4 这些机制都已就位，还剩最后一块拼图——分块形状本身。在本机上重新选择：BK 32→16、TM 8→16、TN 保持 8、线程 256→128。
+
+**优化原理**：
+
+1. **K 分块收窄**：双缓冲共享内存从 64 KB 减半到 32 KB；K 循环次数翻倍，流水步长更细，延迟隐藏更充分；
+2. **计算粒度放大**：每线程从 64 个累加器增到 128 个（16×8 细长 tile），线程数减半，单线程指令级并行（ILP）更强，编译器更容易排满流水线。
+
+**如何实现**：
+
+- `BK=16` 时每线程加载 4 个 float4：`A_ROUNDS = BK*BM/BLOCK_THREADS/4`（A、B 各有 ROUNDS=4 轮搬运）；
+- 内层 fragment 循环只有 15 次迭代，两级流水和 GEMM11B 结构一致：A 侧软件转置预取 + B 侧 cp.async 直拷，`wait_group 0` 管理；
+- 
+
+**代价**：每线程 247 个寄存器（NCU 实测），占用率降到约 2 block/SM——用占用率换单线程 ILP。GEMM12 同时用上两级流水、A 侧软件转置预取、B 侧 cp.async、float4 与 swizzle，是全部优化的集大成版本。
 
 ```cpp
 constexpr int BK = 16, BM = 128, BN = 128, TM = 16, TN = 8;
 constexpr int BLOCK_THREADS = 128;   // dim3 block(16, 8)
 constexpr int A_ROUNDS = BK * BM / BLOCK_THREADS / 4;  // 每线程 4 个 float4
 constexpr int B_ROUNDS = BK * BN / BLOCK_THREADS / 4;
+```
 
-// 主循环：三级流水同时推进（128 线程，BK=16 只有 15 次内层迭代）
-for (int tile = 0; tile < K; tile += BK) {
-    if (next_tile < K) {
-        issue_a_load(next_tile);            // A：LDG 到 ldg_a（软件转置需要）
-        issue_b_copy(next_buf, next_tile);  // B：cp.async 直拷
-        asm volatile("cp.async.commit_group;" ::: "memory");
+```cpp
+__global__ void GEMM12(float* C, const float* A, const float* B, int M, int N, int K) {
+    constexpr int BK = 16, BM = 128, BN = 128, TM = 16, TN = 8;
+    constexpr int BLOCK_THREADS = 128;
+    constexpr int A_ROUNDS = BK * BM / BLOCK_THREADS / 4;  // BK=16 → 每线程 4 个 float4
+    constexpr int B_ROUNDS = BK * BN / BLOCK_THREADS / 4;  // 同上
+    extern __shared__ char smem[];
+    auto& Ads = *reinterpret_cast<float (*)[2][BK][BM]>(smem);
+    auto& Bds = *reinterpret_cast<float (*)[2][BK][BN]>(smem + 2 * BK * BM * sizeof(float));
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int tid = ty * blockDim.x + tx;
+    int tile_m = ty * TM, tile_n = tx * TN;
+    float val[TM][TN] = {0.0f};
+    int buf = 0;
+
+    // A 侧：软件 LDG 中转（需要转置，不能用 cp.async）
+    float4 ldg_a[A_ROUNDS];
+    auto issue_a_load = [&](int tile) {
+        #pragma unroll
+        for (int i = 0; i < A_ROUNDS; i++) {
+            int idx = tid + i * BLOCK_THREADS;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            ldg_a[i] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
+        }
+    };
+    auto commit_a_store = [&](int b) {
+        #pragma unroll
+        for (int i = 0; i < A_ROUNDS; i++) {
+            int idx = tid + i * BLOCK_THREADS;
+            int m = idx / (BK / 4), k = (idx % (BK / 4)) * 4;
+            Ads[b][k + 0][m] = ldg_a[i].x;
+            Ads[b][k + 1][m] = ldg_a[i].y;
+            Ads[b][k + 2][m] = ldg_a[i].z;
+            Ads[b][k + 3][m] = ldg_a[i].w;
+        }
+    };
+
+    // 第二层流水：fragment 双缓冲（两条路径共用）
+    float a_frag[2][TM], b_frag[2][TN];
+    auto issue_frag_load = [&](int b, int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m += 4)
+            *(float4*)&a_frag[(bk + 1) % 2][m] = *(const float4*)&Ads[b][bk + 1][tile_m + m];
+        #pragma unroll
+        for (int n = 0; n < TN; n += 4)
+            *(float4*)&b_frag[(bk + 1) % 2][n] = *(const float4*)&Bds[b][bk + 1][tile_n + n];
+    };
+    auto commit_frag_fma = [&](int bk) {
+        #pragma unroll
+        for (int m = 0; m < TM; m++)
+            #pragma unroll
+            for (int n = 0; n < TN; n++)
+                val[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+    };
+
+    // B 侧：cp.async 直拷（无转置，布局对齐）
+    auto issue_b_copy = [&](int b, int tile) {
+        #pragma unroll
+        for (int i = 0; i < B_ROUNDS; i++) {
+            int idx = tid + i * BLOCK_THREADS;
+            int k = idx / (BN / 4), n = (idx % (BN / 4)) * 4;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                : : "l"(&Bds[b][k][n]), "l"(&B[(tile + k) * N + blockIdx.x * BN + n]) : "memory");
+        }
+    };
+    // 预加载 tile 0：A LDG + B cp.async，提交并全部等待
+    issue_a_load(0);
+    issue_b_copy(0, 0);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    commit_a_store(0);
+    __syncthreads();
+    #pragma unroll
+    for (int m = 0; m < TM; m += 4)
+        *(float4*)&a_frag[0][m] = *(const float4*)&Ads[0][0][tile_m + m];
+    #pragma unroll
+    for (int n = 0; n < TN; n += 4)
+        *(float4*)&b_frag[0][n] = *(const float4*)&Bds[0][0][tile_n + n];
+
+    // 主循环
+    for (int tile = 0; tile < K; tile += BK) {
+        int next_tile = tile + BK;
+        int next_buf = 1 - buf;
+        if (next_tile < K) {
+            issue_a_load(next_tile);
+            issue_b_copy(next_buf, next_tile);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+        // 内层 fragment 流水
+        #pragma unroll
+        for (int bk = 0; bk < BK - 1; bk++) {
+            issue_frag_load(buf, bk);
+            commit_frag_fma(bk);
+        }
+        commit_frag_fma(BK - 1);
+        if (next_tile < K) {
+            // 计算结束，等 B next 全部到位，再落 A next，并预取 fragment
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            commit_a_store(next_buf);
+            __syncthreads();
+            #pragma unroll
+            for (int m = 0; m < TM; m += 4)
+                *(float4*)&a_frag[0][m] = *(const float4*)&Ads[next_buf][0][tile_m + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n += 4)
+                *(float4*)&b_frag[0][n] = *(const float4*)&Bds[next_buf][0][tile_n + n];
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
+        buf = next_buf;
     }
-    for (int bk = 0; bk < BK - 1; bk++) {   // 内层 fragment 双缓冲
-        issue_frag_load(buf, bk);           // 预取 bk+1 排（共享 → 寄存器）
-        commit_frag_fma(bk);                // 算 bk 排（寄存器 FMA）
-    }
-    commit_frag_fma(BK - 1);
-    if (next_tile < K) {
-        asm volatile("cp.async.wait_group 0;" ::: "memory"); // B 全部到位
-        commit_a_store(next_buf);           // A 转置落共享
-        __syncthreads();
-        /* 预取 next 的 fragment 到 a_frag[0] / b_frag[0] */
-    }
-    buf = next_buf;
+
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
+            *(float4*)&C[(blockIdx.y * BM + tile_m + i) * N + blockIdx.x * BN + tile_n + j] = v;
+        }
 }
 ```
 
+
+
+两个方向的调整收益叠加：native 下首次超过 cuBLAS（110.2%），sm_80 下也达到 104%。4096 尺寸 10.85 TFLOPS 对 cuBLAS 的 9.85 TFLOPS。形状调参是最后一块拼图：BK 收窄让流水步长更细，TM 放大让单线程 ILP 更强。
+
+<br>
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -710,15 +1874,6 @@ for (int tile = 0; tile < K; tile += BK) {
 <tr><td>GEMM12</td><td align="right">12.67</td><td align="right">10.85</td><td align="right">110.2%</td><td align="right">13.77</td><td align="right">9.98</td><td align="right">104.0%</td></tr>
 </tbody>
 </table>
-两个方向的调整：
-
-1. **K 分块收窄**：双缓冲共享内存从 64 KB 减半到 32 KB；K 循环次数翻倍，流水步长更细，延迟隐藏更充分。
-2. **计算粒度放大**：每线程从 64 个累加器增到 128 个（16×8 细长 tile），线程数减半，单线程指令级并行（ILP）更强，编译器更容易排满流水线。
-
-代价是每线程 247 个寄存器（NCU 实测），占用率降到约 2 block/SM——用占用率换单线程 ILP。GEMM12 同时用上两级流水、A 侧软件转置预取、B 侧 cp.async、float4 与 swizzle，是全部优化的集大成版本，4096 尺寸 10.85 TFLOPS，超过 cuBLAS 的 9.85 TFLOPS。
-
-
-形状调参是最后一块拼图：BK 收窄让流水步长更细，TM 放大让单线程 ILP 更强。native 下首次超过 cuBLAS（110.2%），sm_80 下也达到 104%。
 
 ### 工业基准：cuBLAS / cuBLASLt
 
