@@ -129,6 +129,7 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 <tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
 </tbody>
 </table>
+
 **一些问题：**
 - 每个线程只算一个输出。每做一次 FMA，就要读两次全局内存，计算和访存的比例是 1:2，极低，SM 浮点运算单元跑不满，无法隐藏访存延迟。
 - 每个 C 元素都要读一整行 A 和一整列 B，相同位置元素被重复读取，完成全部计算需要 2 * K * M * N。要知道全局内存访问延迟最高，频繁重复的访问浪费大量时间。
@@ -190,6 +191,7 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
 <tr><td>GEMM2</td><td align="right">110.52</td><td align="right">1.24</td><td align="right">12.6%</td><td align="right">108.29</td><td align="right">1.27</td><td align="right">13.2%</td></tr>
 </tbody>
 </table>
+
 **收益：**
 
 A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元素被 tx 方向的 32 个线程共用。
@@ -206,7 +208,7 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 **GEMM3 一维粗化**：每线程沿 M 方向负责 TM=8 个结果，block 扩到 32×16 共 512 线程，覆盖 128×32 的输出 tile。一个 warp 32 个线程恰好覆盖 BN=32 列，每个线程持 8 个累加器。每个内层 k 迭代读 8 个 A、1 个 B，做 8 次 FMA，计算访存比从 1:2 升到 8:9。
 
-![一维线程粗化](images/sib_05_1d_blocktiling.png)
+![一维线程粗化](images/GEMM3.png)
 
 <table>
 <thead>
