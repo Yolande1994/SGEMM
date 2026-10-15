@@ -316,120 +316,74 @@ __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, in
 | GEMM3 | 36.54 | 3.76 | 38.2% |
 | GEMM4 | 21.25 | 6.47 | 65.7% |
 
-native 下二维粗化收益明显（1.72×）。
-
-**线程粗化的代价**：64 个累加器 + 其他临时变量，单线程寄存器增加到 96 个，occupancy 开始下降，这会降低 SM 中可供切换的 warp 数量，隐藏延迟的能力下降。
+**代价**：线程粗化因子也不是越大越好，因子越大，累加器占用的寄存器数量越多，occupancy 开始下降，这会降低 SM 中可供切换的 warp 数量，使延迟隐藏能力降低。
 
 <br>
 
-### 协作加载（cooperative loading）
+## GEMM5：寄存器复用
 
-上面的 GEMM3/GEMM4 都用同一个技巧把全局数据搬进共享内存：把 (m, k) 二维索引展开成一维 `i`，用整个 block 的线程步长循环协作填充——每个线程搬 4~8 个 float4，全局内存按行连续读取，天然合并（coalesced）。这就是协作加载：
+看 **GEMM4** 内层三重循环：
 
 ```cpp
-// BM×BK 的 A 分块，由 block 内全部线程步长协作搬入共享内存
-for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
-    int m = i / (BK / 4), k = (i %% (BK / 4)) * 4;   // 一维 i → 二维 (m, k)
-    *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
-}
+for k in BK:
+  for i in TM:
+    for j in TN:
+      val[i][j] += Ads[ty*TM+i][k] * Bds[k][tx*TN+j]
 ```
 
-它保证两件事：**每个线程连续搬 4 个 float（一条 float4 指令）**，且 **warp 内相邻线程访问全局内存相邻地址（合并访问）**。之后所有版本的加载都沿用这个写法。
+Bds 的同一个值在 i 循环里被重复读了 TM 次。
 
-### 三级 Tiling 总览
+如果把 Bds 的这一行先读到寄存器，就不用反复访问 shared。
 
-到这里，GEMM2→GEMM3→GEMM4 完成了三层 Tiling 的完整骨架。一张图看懂分块结构：
-
-![三级 Tiling](images/sib_19_tiling_overview.png)
-
-- **输出分块**：grid 划分输出 C，一个 block 负责 BM×BN=128×128；
-- **线程分块**：block 内 256 个线程，每线程负责 TM×TN=8×8=64 个输出（寄存器）；
-- **K 分块**：一次搬 BK=32 行 k 进共享内存，K 方向循环 128 次（4096/32）。
-
-### 三层循环对应三级存储
-
-主循环天然对应三层存储，这是后续一切优化的坐标系：
-
-![三层循环](images/sib_13_loop_structure.png)
-
-| 循环 | 对应存储 | 数据复用 | 数据量 |
-| --- | --- | --- | --- |
-| tile 循环（K 方向） | 全局内存 ↔ 共享内存 | 每个 tile 读一次 | BM×BK + BK×BN |
-| k 内层循环（BK 方向） | 共享内存 ↔ 寄存器 | 每行 k 读一次 | TM + TN |
-| i/j 内层循环（TM/TN） | 寄存器 ↔ FMA | 寄存器内复用 | 0（不访存） |
-
-三层循环的每一层都对应一次"把数据从慢层级搬到快层级、然后重复使用"的动作。优化就是逐层提高复用次数、降低访存次数。
-
-<br>
-
-## 阶段四：寄存器复用（GEMM5）
-
-**要解决的问题**：GEMM4 的内层三重循环里，同一个 B 值在 i 循环中被重复读了 8 次（每读一次做 1 次 FMA）；同一个 A 值在 j 循环中也被重复读了 8 次。64 次 FMA 对应 64 次共享内存读，共享内存被反复访问。
-
-**优化原理**：
-
-- 把 B 的 TN 个值一次性读进寄存器数组 `b_val[TN]`，再对每个 i 读一次 A、用寄存器里的 b_val 做 TN 次 FMA；
-- 共享内存访问次数：Bds 从 TM×TN 降到 TN，Ads 从 TM×TN 降到 TM；TM=TN=8 时从 64 次降到 16 次，降 4 倍；
-- 本质与 GEMM2 是同一个动作：把数据从慢层级搬到快层级反复使用。GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器）。寄存器比共享内存更快、又不占带宽，是更彻底的复用。
-
-**如何实现**：
-
-- 内层 k 循环改成两段：先 `for (j) b_val[j] = Bds[k][tx*TN+j]` 把 B 读进寄存器；再 `for (i) for (j) val[i][j] += a_val * b_val[j]` 纯寄存器 FMA；
-- A 值每次读一个标量 `Ads[ty*TM+i][k]` 进寄存器，被 8 个 b_val 复用。
+**实现**：
+- 先读 B 的 TN 个值到寄存器数组 b_val[TN]。
+- 再对每个 i，读一次 Ads 到寄存器，用 b_val 做 TN 次 FMA。
+- Bds 访问次数：TM*TN → TN。
+- Ads 访问次数：TM*TN → TM。
 
 ![寄存器复用](images/sib_08_reg_blocking.png)
 
 ```cpp
-__global__ void GEMM5(float* C, const float* A, const float* B, int M, int N, int K) {
-    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
-    __shared__ float Ads[BM][BK];
-    __shared__ float Bds[BK][BN];
-    int ty = threadIdx.y, tx = threadIdx.x;
-    int tid = ty * blockDim.x + tx;
-    // 每线程的 TM×TN=64 个寄存器累加器（与 GEMM4 相同）
-    float val[TM][TN] = {0.0f};
-
-    for (int tile = 0; tile < K; tile += BK) {
-        for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
-            int m = i / BK, k = i % BK;
-            Ads[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
-        }
-        for (int i = tid; i < BK * BN; i += blockDim.x * blockDim.y) {
-            int k = i / BN, n = i % BN;
-            Bds[k][n] = B[(tile + k) * N + blockIdx.x * BN + n];
-        }
-        __syncthreads();
-
-        for (int k = 0; k < BK; k++) {
-            // 本版核心：先把 B 的 TN 个值读到寄存器，之后 TM×TN 次 FMA 都不再访问 Bds
-            float b_val[TN];
-            for (int j = 0; j < TN; j++)
-                b_val[j] = Bds[k][tx * TN + j];
-            // 再读 A 的 TM 个值，做 TM*TN 次 FMA
-            for (int i = 0; i < TM; i++) {
-                float a_val = Ads[ty * TM + i][k];
-                for (int j = 0; j < TN; j++)
-                    val[i][j] += a_val * b_val[j];
-            }
-        }
-        __syncthreads();
-    }
-
-    for (int i = 0; i < TM; i++)
+// 除计算阶段以外，所有代码与上版本完全相同，不再赘述
+// 计算阶段
+for (int k = 0; k < BK; k++) {
+    // 本版核心：先把 B 的 TN 个值读到寄存器，之后 TM×TN 次 FMA 都不再访问 Bds
+    float b_val[TN];
+    for (int j = 0; j < TN; j++)
+        b_val[j] = Bds[k][tx * TN + j];
+    // 再读 A 的 TM 个值，做 TM*TN 次 FMA
+    for (int i = 0; i < TM; i++) {
+        float a_val = Ads[ty * TM + i][k];
         for (int j = 0; j < TN; j++)
-            C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = val[i][j];
+            val[i][j] += a_val * b_val[j];
+    }
 }
+__syncthreads();
 ```
 
+**收益**：
 
+每 k 迭代共享内存读从 128 次降到 16 次（B 侧 64→8、A 侧 64→8），降为原来的 1/8
 
-本机实测 GEMM5 与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS，native 下 1.01×）。诚实交代：此刻的瓶颈已转向全局访存指令数，共享内存带宽还没有成为瓶颈，寄存器复用的收益没有显现出来。这一版的价值是**确立了后续所有 kernel 的内层结构**——先读寄存器、再做 FMA，GEMM6 之后每一版都在这个结构上叠加新机制。
+这个方法在 shared memory 带宽成为瓶颈时收益明显。
+
+**代价**：多占 TN=8 个临时寄存器。
+
+**GEMM5 和 GEMM2** 本质上做同一件事：把数据从慢的层级搬到快的层级，在快层级里反复使用，减少对慢层级的访问。
+
+区别在于：GEMM2 是跨线程复用（共享内存），GEMM5 是线程内复用（寄存器）。
 
 <br>
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
 | GEMM4 | 21.25 | 6.47 | 65.7% |
 | GEMM5 | 21.00 | 6.55 | 66.5% |
+
+本机实测 GEMM5 与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS）。诚实交代：此刻的瓶颈已转向全局访存指令数，共享内存带宽还没有成为瓶颈，寄存器复用的收益未显现。
+
+这一版的价值是**确立了后续所有 kernel 的内层结构**：先读寄存器、再做 FMA，GEMM6 之后每一版都在这个结构基础上展开。
+
+<br>
 
 ## 阶段五：float4 向量化（GEMM6、GEMM6B）
 
