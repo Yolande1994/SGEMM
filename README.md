@@ -122,8 +122,8 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
@@ -182,8 +182,8 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
@@ -210,8 +210,8 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM2</td><td align="right">110.52</td><td align="right">1.24</td><td align="right">12.6%</td><td align="right">108.29</td><td align="right">1.27</td><td align="right">13.2%</td></tr>
@@ -226,8 +226,8 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM3</td><td align="right">36.54</td><td align="right">3.76</td><td align="right">38.2%</td><td align="right">39.77</td><td align="right">3.46</td><td align="right">36.0%</td></tr>
@@ -298,8 +298,8 @@ for (int k = 0; k < BK; k++) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM4</td><td align="right">21.25</td><td align="right">6.47</td><td align="right">65.7%</td><td align="right">40.91</td><td align="right">3.36</td><td align="right">35.0%</td></tr>
@@ -328,8 +328,8 @@ for (int i = tid; i < BM * (BK / 4); i += blockDim.x) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM5</td><td align="right">21.00</td><td align="right">6.55</td><td align="right">66.5%</td><td align="right">42.00</td><td align="right">3.27</td><td align="right">34.1%</td></tr>
@@ -361,8 +361,8 @@ for (int k = 0; k < BK; k++) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM6</td><td align="right">20.88</td><td align="right">6.58</td><td align="right">66.8%</td><td align="right">19.67</td><td align="right">6.99</td><td align="right">72.8%</td></tr>
@@ -403,8 +403,8 @@ for (int k = 0; k < BK; k += 4) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM6B</td><td align="right">18.58</td><td align="right">7.40</td><td align="right">75.1%</td><td align="right">19.78</td><td align="right">6.95</td><td align="right">72.4%</td></tr>
@@ -427,8 +427,8 @@ for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM7</td><td align="right">42.32</td><td align="right">3.25</td><td align="right">33.0%</td><td align="right">42.86</td><td align="right">3.21</td><td align="right">33.4%</td></tr>
@@ -454,8 +454,8 @@ auto swizzle = [](int n, int k) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM7B</td><td align="right">21.29</td><td align="right">6.46</td><td align="right">65.6%</td><td align="right">21.79</td><td align="right">6.31</td><td align="right">65.7%</td></tr>
@@ -496,8 +496,8 @@ for (int tile = 0; tile < K; tile += BK) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM8</td><td align="right">16.27</td><td align="right">8.45</td><td align="right">85.8%</td><td align="right">17.81</td><td align="right">7.72</td><td align="right">80.4%</td></tr>
@@ -522,8 +522,8 @@ asm volatile("cp.async.wait_group 1;" ::: "memory");
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
@@ -548,8 +548,8 @@ if (next_tile < K) commit_store(a_next, b_next, next_buf);
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
@@ -582,8 +582,8 @@ commit_b_store(next_buf);   // B 的转置+swizzle 落共享
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM10</td><td align="right">17.79</td><td align="right">7.73</td><td align="right">78.5%</td><td align="right">19.17</td><td align="right">7.17</td><td align="right">74.7%</td></tr>
@@ -616,8 +616,8 @@ for (int bk = 0; bk < BK - 1; bk++) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM10B</td><td align="right">16.82</td><td align="right">8.17</td><td align="right">83.0%</td><td align="right">18.03</td><td align="right">7.62</td><td align="right">79.5%</td></tr>
@@ -651,8 +651,8 @@ commit_a_store(next_buf);
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM11</td><td align="right">17.80</td><td align="right">7.72</td><td align="right">78.4%</td><td align="right">17.84</td><td align="right">7.71</td><td align="right">80.3%</td></tr>
@@ -696,8 +696,8 @@ for (int tile = 0; tile < K; tile += BK) {
 
 <table>
 <thead>
-<tr><th rowspan="2">4096 尺寸<br>版本</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
+<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
+<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
 </thead>
 <tbody>
 <tr><td>GEMM11B</td><td align="right">16.39</td><td align="right">8.39</td><td align="right">85.2%</td><td align="right">15.95</td><td align="right">8.62</td><td align="right">89.8%</td></tr>
