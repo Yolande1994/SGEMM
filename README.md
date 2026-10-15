@@ -124,15 +124,9 @@ __global__ void GEMM1(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM1 | 188.49 | 0.73 | 7.4% |
 
 **一些问题：**
 - 每个线程只算一个输出。每做一次 FMA，就要读两次全局内存，计算和访存的比例是 1:2，极低，SM 浮点运算单元跑不满，无法隐藏访存延迟。
@@ -185,16 +179,10 @@ __global__ void GEMM2(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM1</td><td align="right">188.49</td><td align="right">0.73</td><td align="right">7.4%</td><td align="right">149.75</td><td align="right">0.92</td><td align="right">9.6%</td></tr>
-<tr><td>GEMM2</td><td align="right">110.52</td><td align="right">1.24</td><td align="right">12.6%</td><td align="right">108.29</td><td align="right">1.27</td><td align="right">13.2%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM1 | 188.49 | 0.73 | 7.4% |
+| GEMM2 | 110.52 | 1.24 | 12.6% |
 
 **收益：**
 
@@ -266,16 +254,10 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM2</td><td align="right">110.52</td><td align="right">1.24</td><td align="right">12.6%</td><td align="right">108.29</td><td align="right">1.27</td><td align="right">13.2%</td></tr>
-<tr><td>GEMM3</td><td align="right">36.54</td><td align="right">3.76</td><td align="right">38.2%</td><td align="right">39.77</td><td align="right">3.46</td><td align="right">36.0%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM2 | 110.52 | 1.24 | 12.6% |
+| GEMM3 | 36.54 | 3.76 | 38.2% |
 
 <br>
 
@@ -329,22 +311,14 @@ __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM3</td><td align="right">36.54</td><td align="right">3.76</td><td align="right">38.2%</td><td align="right">39.77</td><td align="right">3.46</td><td align="right">36.0%</td></tr>
-<tr><td>GEMM4</td><td align="right">21.25</td><td align="right">6.47</td><td align="right">65.7%</td><td align="right">40.91</td><td align="right">3.36</td><td align="right">35.0%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM3 | 36.54 | 3.76 | 38.2% |
+| GEMM4 | 21.25 | 6.47 | 65.7% |
 
-native 下二维粗化收益明显；sm_80 下反而略降。
+native 下二维粗化收益明显（1.72×）。
 
-GEMM4 把大量寻址计算交给编译器排布，两个后端指令调度和寄存器分配的结果不同，性能就此分叉——这是第一次出现明显的编译目标分歧，之后还会反复遇到。
-
-**线程粗化的代价**：64 个累加器 + 寻址临时变量，单线程寄存器接近 100 个，occupancy 开始下降，这会降低 SM 中可供切换的 warp 数量，隐藏延迟的能力下降。
+**线程粗化的代价**：64 个累加器 + 其他临时变量，单线程寄存器增加到 96 个，occupancy 开始下降，这会降低 SM 中可供切换的 warp 数量，隐藏延迟的能力下降。
 
 <br>
 
@@ -449,19 +423,13 @@ __global__ void GEMM5(float* C, const float* A, const float* B, int M, int N, in
 
 
 
-本机实测 GEMM5 与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS，native 下 1.01×；sm_80 下 0.97× 小幅回落）。诚实交代：此刻的瓶颈已转向全局访存指令数，共享内存带宽还没有成为瓶颈，寄存器复用的收益没有显现出来。这一版的价值是**确立了后续所有 kernel 的内层结构**——先读寄存器、再做 FMA，GEMM6 之后每一版都在这个结构上叠加新机制。
+本机实测 GEMM5 与 GEMM4 基本持平（6.55 vs 6.47 TFLOPS，native 下 1.01×）。诚实交代：此刻的瓶颈已转向全局访存指令数，共享内存带宽还没有成为瓶颈，寄存器复用的收益没有显现出来。这一版的价值是**确立了后续所有 kernel 的内层结构**——先读寄存器、再做 FMA，GEMM6 之后每一版都在这个结构上叠加新机制。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM4</td><td align="right">21.25</td><td align="right">6.47</td><td align="right">65.7%</td><td align="right">40.91</td><td align="right">3.36</td><td align="right">35.0%</td></tr>
-<tr><td>GEMM5</td><td align="right">21.00</td><td align="right">6.55</td><td align="right">66.5%</td><td align="right">42.00</td><td align="right">3.27</td><td align="right">34.1%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM4 | 21.25 | 6.47 | 65.7% |
+| GEMM5 | 21.00 | 6.55 | 66.5% |
 
 ## 阶段五：float4 向量化（GEMM6、GEMM6B）
 
@@ -529,20 +497,14 @@ __global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, in
 
 
 
-native 下 float4 收益很小（1.01×）——native 后端自己就能把标量加载合并成向量指令；sm_80 后端下访存指令数直接减到 1/4，收益放大到 2.13×。同一份代码、两个编译目标表现天差地别，这是编译目标影响性能的第一个明显案例。
+native 下 float4 收益很小（1.01×）——native 后端自己就能把标量加载合并成向量指令，收益已被编译器榨取。
 
 ### GEMM6B：计算阶段 float4
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM5</td><td align="right">21.00</td><td align="right">6.55</td><td align="right">66.5%</td><td align="right">42.00</td><td align="right">3.27</td><td align="right">34.1%</td></tr>
-<tr><td>GEMM6</td><td align="right">20.88</td><td align="right">6.58</td><td align="right">66.8%</td><td align="right">19.67</td><td align="right">6.99</td><td align="right">72.8%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM5 | 21.00 | 6.55 | 66.5% |
+| GEMM6 | 20.88 | 6.58 | 66.8% |
 
 **要解决的问题**：GEMM6 只向量化了访存阶段，计算阶段读 Bds 仍是标量（一条 LDS 读 4 字节），指令数依旧偏多。
 
@@ -602,19 +564,13 @@ __global__ void GEMM6B(float* C, const float* A, const float* B, int M, int N, i
 
 
 
-native 下计算阶段 float4 带来 1.12×；sm_80 下没有收益（6.95 vs 6.99 TFLOPS，0.99×）——该后端的 LDS 调度已经足够紧凑。优化收益依赖编译目标，这是又一个例证。GEMM6B 之后性能进入平台期，真正的瓶颈已经转移到共享内存 bank 冲突上——下一阶段专门处理它。
+native 下计算阶段 float4 带来 1.12×，计算阶段 LDS 指令数压到 1/4。GEMM6B 之后性能进入平台期，真正的瓶颈已经转移到共享内存 bank 冲突上——下一阶段专门处理它。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM6</td><td align="right">20.88</td><td align="right">6.58</td><td align="right">66.8%</td><td align="right">19.67</td><td align="right">6.99</td><td align="right">72.8%</td></tr>
-<tr><td>GEMM6B</td><td align="right">18.58</td><td align="right">7.40</td><td align="right">75.1%</td><td align="right">19.78</td><td align="right">6.95</td><td align="right">72.4%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM6 | 20.88 | 6.58 | 66.8% |
+| GEMM6B | 18.58 | 7.40 | 75.1% |
 
 ## 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
@@ -693,20 +649,14 @@ __global__ void GEMM7(float* C, const float* A, const float* B, int M, int N, in
 
 
 
-GEMM7 是本仓库唯一的纯负面教材：性能比上一版腰斩（native 0.49×、sm_80 0.48×）。保留它是为了直观展示"为了一点收益乱改布局"的代价。
+GEMM7 是本仓库唯一的纯负面教材：性能比上一版腰斩（native 0.49×）。保留它是为了直观展示"为了一点收益乱改布局"的代价。
 
 ### GEMM7B：k_offset 循环移位（只修好一半）
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM6B</td><td align="right">18.58</td><td align="right">7.40</td><td align="right">75.1%</td><td align="right">19.78</td><td align="right">6.95</td><td align="right">72.4%</td></tr>
-<tr><td>GEMM7</td><td align="right">42.32</td><td align="right">3.25</td><td align="right">33.0%</td><td align="right">42.86</td><td align="right">3.21</td><td align="right">33.4%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM6B | 18.58 | 7.40 | 75.1% |
+| GEMM7 | 42.32 | 3.25 | 33.0% |
 
 **做了什么**：与 GEMM7 的唯一区别在计算循环的 k 起点——按线程编号旋转：
 
@@ -779,16 +729,10 @@ k_offset 把计算阶段修复后性能从 3.25 提到 6.46 TFLOPS（1.99×/1.97
 
 ### GEMM8：XOR Swizzle（一次解决两处冲突）
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM7</td><td align="right">42.32</td><td align="right">3.25</td><td align="right">33.0%</td><td align="right">42.86</td><td align="right">3.21</td><td align="right">33.4%</td></tr>
-<tr><td>GEMM7B</td><td align="right">21.29</td><td align="right">6.46</td><td align="right">65.6%</td><td align="right">21.79</td><td align="right">6.31</td><td align="right">65.7%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM7 | 42.32 | 3.25 | 33.0% |
+| GEMM7B | 21.29 | 6.46 | 65.6% |
 
 **优化原理**：不改变物理存储大小，通过按位异或把"行号的一部分位"混入"列地址"，让相同列 k 在不同行 n 上落到不同的 bank：
 
@@ -880,16 +824,10 @@ __global__ void GEMM8(float* C, const float* A, const float* B, int M, int N, in
 加载和计算两处套同一个映射，冲突从 32/16 路降到 4/2 路。4096 尺寸 8.45 TFLOPS，比 GEMM6B 高 14%。XOR Swizzle 是解决 bank 冲突的通用方案，后续 GEMM9–GEMM12 全部沿用 swizzle 布局。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM7B</td><td align="right">21.29</td><td align="right">6.46</td><td align="right">65.6%</td><td align="right">21.79</td><td align="right">6.31</td><td align="right">65.7%</td></tr>
-<tr><td>GEMM8</td><td align="right">16.27</td><td align="right">8.45</td><td align="right">85.8%</td><td align="right">17.81</td><td align="right">7.72</td><td align="right">80.4%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM7B | 21.29 | 6.46 | 65.6% |
+| GEMM8 | 16.27 | 8.45 | 85.8% |
 
 ## 阶段七：双缓冲与软件流水（GEMM9、GEMM9B、GEMM10、GEMM10B）
 
@@ -992,20 +930,14 @@ __global__ void GEMM9(float* C, const float* A, const float* B, int M, int N, in
 
 
 
-诚实交代：这一版是负优化。4096 尺寸 native 6.68 TFLOPS（0.79×）、sm_80 4.77 TFLOPS（0.62×）——预取整段排在计算前面，LDG 延迟没被覆盖，64 KB 共享内存还压低了占用率。这正是 GEMM10 要解决的问题。
+诚实交代：这一版是负优化。4096 尺寸 native 6.68 TFLOPS（0.79×）——预取整段排在计算前面，LDG 延迟没被覆盖，64 KB 共享内存还压低了占用率。这正是 GEMM10 要解决的问题。
 
 ### GEMM9B：cp.async 双缓冲
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM8</td><td align="right">16.27</td><td align="right">8.45</td><td align="right">85.8%</td><td align="right">17.81</td><td align="right">7.72</td><td align="right">80.4%</td></tr>
-<tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM8 | 16.27 | 8.45 | 85.8% |
+| GEMM9 | 20.59 | 6.68 | 67.8% |
 
 **背景**：cp.async 是 sm_80 引入的异步拷贝指令，一条指令把数据从全局内存直接搬进共享内存，**不经过寄存器、不占用 warp 发射槽**——warp 发完立即返回，DMA 引擎在后台搬运，搬运和计算是真正的并行。
 
@@ -1106,20 +1038,14 @@ __global__ void GEMM9B(float* C, const float* A, const float* B, int M, int N, i
 
 
 
-cp.async 把 A 侧的加载交给 DMA 引擎。native 下收益很小（1.01×）——软件预取被编译器优化得已经不错；sm_80 下 DMA 的异步优势才真正显现（1.22×）。优化手段的价值同样取决于编译目标。
+cp.async 把 A 侧的加载交给 DMA 引擎。native 下收益很小（1.01×）——软件预取被编译器优化得已经不错。
 
 ### GEMM10：寄存器软件流水（全流水）
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
-<tr><td>GEMM9B</td><td align="right">20.46</td><td align="right">6.72</td><td align="right">68.2%</td><td align="right">23.57</td><td align="right">5.83</td><td align="right">60.8%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM9 | 20.59 | 6.68 | 67.8% |
+| GEMM9B | 20.46 | 6.72 | 68.2% |
 
 **要解决的问题**：GEMM9B 只有 A 侧真正异步。不引入新硬件，能不能靠指令调度让 A、B 两侧的加载都真正重叠？
 
@@ -1233,20 +1159,14 @@ __global__ void GEMM10(float* C, const float* A, const float* B, int M, int N, i
 
 
 
-把"加载"拆成 issue（发 LDG 不等）和 commit（消费时才等），中间填 FMA，双缓冲才真正流起来。4096 尺寸 native 下 7.73 TFLOPS（1.16×），sm_80 下 7.17 TFLOPS（1.50×）——sm_80 后端不会自动做这种调度，显式排布的收益被放大。
+把"加载"拆成 issue（发 LDG 不等）和 commit（消费时才等），中间填 FMA，双缓冲才真正流起来。4096 尺寸 native 下 7.73 TFLOPS（1.16×）。
 
 ### GEMM10B：混合流水（cp.async A + 寄存器预取 B）
 
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM9</td><td align="right">20.59</td><td align="right">6.68</td><td align="right">67.8%</td><td align="right">28.84</td><td align="right">4.77</td><td align="right">49.7%</td></tr>
-<tr><td>GEMM10</td><td align="right">17.79</td><td align="right">7.73</td><td align="right">78.5%</td><td align="right">19.17</td><td align="right">7.17</td><td align="right">74.7%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM9 | 20.59 | 6.68 | 67.8% |
+| GEMM10 | 17.79 | 7.73 | 78.5% |
 
 **做了什么**：A 不需要转置，改用 cp.async 直拷（DMA 后台搬运、不占寄存器，省掉 4 个 float4 预取寄存器）；B 仍要转置 + swizzle，保留寄存器预取。寄存器占用从 155 降到 141。
 
@@ -1366,19 +1286,13 @@ __global__ void GEMM10B(float* C, const float* A, const float* B, int M, int N, 
 
 
 
-A 改用 cp.async 省掉 4 个 float4 预取寄存器（155→141），两个编译目标下都有稳定提升（均 1.06×）——省下来的寄存器压力确实转化成了调度空间。
+A 改用 cp.async 省掉 4 个 float4 预取寄存器（155→141），native 下仍有稳定提升（1.06×）——省下来的寄存器压力确实转化成了调度空间。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM10</td><td align="right">17.79</td><td align="right">7.73</td><td align="right">78.5%</td><td align="right">19.17</td><td align="right">7.17</td><td align="right">74.7%</td></tr>
-<tr><td>GEMM10B</td><td align="right">16.82</td><td align="right">8.17</td><td align="right">83.0%</td><td align="right">18.03</td><td align="right">7.62</td><td align="right">79.5%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM10 | 17.79 | 7.73 | 78.5% |
+| GEMM10B | 16.82 | 8.17 | 83.0% |
 
 ## 阶段八：两级流水线（GEMM11、GEMM11B）
 
@@ -1540,7 +1454,7 @@ __global__ void GEMM11(float* C, const float* A, const float* B, int M, int N, i
 
 
 
-诚实交代：两级流水在本机没有带来提升，native 下反而略降（0.94×）——SMEM→寄存器的读延迟在 BK=32 时没有被充分暴露，第一级流水还叠加了转置布局的开销；sm_80 下微升（1.01×）。两个编译目标结论相反，属于典型的编译器调度差异。它的意义在下一版（GEMM11B）才兑现。
+诚实交代：两级流水在本机没有带来提升，native 下反而略降（0.94×）——SMEM→寄存器的读延迟在 BK=32 时没有被充分暴露，第一级流水还叠加了转置布局的开销。它的意义在下一版（GEMM11B）才兑现。
 
 ### GEMM11B：B 侧走 cp.async
 
@@ -1685,19 +1599,13 @@ __global__ void GEMM11B(float* C, const float* A, const float* B, int M, int N, 
 
 
 
-B 布局与全局行主序对齐后改走 cp.async，省掉整条 B 路预取寄存器和转置指令，显存吞吐从 46% 升到 83.5%——上一版两级流水的铺垫在这里兑现（native 1.09×、sm_80 1.12×）。
+B 布局与全局行主序对齐后改走 cp.async，省掉整条 B 路预取寄存器和转置指令，显存吞吐从 46% 升到 83.5%——上一版两级流水的铺垫在这里兑现（native 1.09×）。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM11</td><td align="right">17.80</td><td align="right">7.72</td><td align="right">78.4%</td><td align="right">17.84</td><td align="right">7.71</td><td align="right">80.3%</td></tr>
-<tr><td>GEMM11B</td><td align="right">16.39</td><td align="right">8.39</td><td align="right">85.2%</td><td align="right">15.95</td><td align="right">8.62</td><td align="right">89.8%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM11 | 17.80 | 7.72 | 78.4% |
+| GEMM11B | 16.39 | 8.39 | 85.2% |
 
 ## 阶段九：分块形状调参（GEMM12）
 
@@ -1847,19 +1755,13 @@ __global__ void GEMM12(float* C, const float* A, const float* B, int M, int N, i
 
 
 
-两个方向的调整收益叠加：native 下首次超过 cuBLAS（110.2%），sm_80 下也达到 104%。4096 尺寸 10.85 TFLOPS 对 cuBLAS 的 9.85 TFLOPS。形状调参是最后一块拼图：BK 收窄让流水步长更细，TM 放大让单线程 ILP 更强。
+两个方向的调整收益叠加：native 下首次超过 cuBLAS（110.2%）。4096 尺寸 10.85 TFLOPS 对 cuBLAS 的 9.85 TFLOPS。形状调参是最后一块拼图：BK 收窄让流水步长更细，TM 放大让单线程 ILP 更强。
 
 <br>
-<table>
-<thead>
-<tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
-<tr><th>版本</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th><th align="right">耗时(ms)</th><th align="right">TFLOPS</th><th align="right">占cuBLAS %</th></tr>
-</thead>
-<tbody>
-<tr><td>GEMM11B</td><td align="right">16.39</td><td align="right">8.39</td><td align="right">85.2%</td><td align="right">15.95</td><td align="right">8.62</td><td align="right">89.8%</td></tr>
-<tr><td>GEMM12</td><td align="right">12.67</td><td align="right">10.85</td><td align="right">110.2%</td><td align="right">13.77</td><td align="right">9.98</td><td align="right">104.0%</td></tr>
-</tbody>
-</table>
+| 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
+| --- | ---: | ---: | ---: |
+| GEMM11B | 16.39 | 8.39 | 85.2% |
+| GEMM12 | 12.67 | 10.85 | 110.2% |
 
 ### 工业基准：cuBLAS / cuBLASLt
 
@@ -1905,7 +1807,7 @@ cuBLASLt 是可配置层，通过 matmul desc、layout、heuristic 三个描述�
 # 本机原生架构（测试机为 Blackwell sm_120）
 nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=native GEMM.cu -o GEMM -lcublas -lcublasLt
 
-# 指定 Ampere 目标，用于对比编译目标对性能的影响
+# 指定 Ampere 目标，跑第二套基准（对应测试环境说明）
 nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_80 GEMM.cu -o GEMM -lcublas -lcublasLt
 
 # 多架构兼容编译
@@ -1987,20 +1889,6 @@ M=N=K=4096、NCU 锁定时钟下的计算与显存吞吐利用率（锁定时钟
 | GEMM11B | 两级 + cp.async | 16.39 | 8.39 | 85.2% |
 | GEMM12 | 自定义分块 | 12.67 | 10.85 | 110.2% |
 | GEMM13 | cuBLAS (FP32) | 13.96 | 9.85 | 100.0% |
-4096 尺寸两种编译目标的对比（占 cuBLAS 百分比）：
-
-![相对 cuBLAS 性能](images/ratio_cublas_4096.png)
-
-## 编译目标：native 与 sm_80 的差异
-
-同一台机器、同一份代码，只切换编译目标（sm_120 原生与 sm_80 前向兼容 PTX），性能差异高度依赖 kernel 的写法：
-
-- **依赖编译器调度的版本（GEMM4、GEMM5、GEMM9）**：sm_80 下明显变慢，GEMM3/GEMM4 在 3072 尺寸慢近一倍，GEMM9 慢约 40%。指令调度的自由度留给了编译器，不同后端的调度差异被直接放大。
-- **显式向量化 / cp.async / 手工流水版本（GEMM6、GEMM10、GEMM11B、GEMM12）**：差异收敛到 ±10%；GEMM11B 在中大尺寸下 sm_80 反而快 1%~3%。
-- **最朴素的 GEMM1/GEMM2 和库基准几乎不受影响**。
-
-编译目标改变的是编译器的指令调度和寄存器分配结果，不是硬件本身。写法越固定（显式 float4、内联 PTX、手工 issue/commit）的 kernel，跨编译目标越稳定；生产环境应始终针对部署架构（`-arch=native` 或明确的 `sm_xx`）编译。
-
 ## 文件结构
 
 ```
