@@ -212,7 +212,7 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 **GEMM2** 虽然优化了全局访存量，但每线程仍只算 1 个输出元素。内层 k 循环里每做 1 次 FMA 要读 2 次共享内存（Ads 和 Bds 各 1 次），计算访存比是 1:2，浮点单元每工作 1 拍就要等 2 次访存，大量空闲。
 
-**本阶段思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，每次访存换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续优化的地基。
+**本阶段思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，这样每次访存能换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续优化的地基。
 
 <br>
 
@@ -222,8 +222,7 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 **说明**：
 
-- 每线程沿 M 方向负责 TM=8 个输出元素，A 值读进寄存器 1 次、被 8 个累加器共享；
-- B 值读 1 次，参与 8 次 FMA；
+- 每线程沿 M 方向负责 TM=8 个输出元素；B 值读 1 次、被 8 个累加器共享（参与 8 次 FMA）
 - 每个内层 k 迭代：读 8 个 A + 1 个 B，做 8 次 FMA，计算访存比从 1:2 升到 8:9；
 - block 改为 32×16=512 线程，覆盖 128×32 的输出 tile；warp 的 32 个线程恰好覆盖 BN=32 列，B 的读取天然合并。
 
@@ -282,21 +281,15 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 
 ## GEMM4：二维线程粗化（TM=TN=8）
 
-**要解决的问题**：GEMM3 只粗化了 M 方向，B 值读进寄存器 1 次只用 1 次；N 方向的复用没有利用起来，共享内存访问量仍然偏高。
-
-**优化原理**：
-
-- 两个方向同时粗化：每线程负责 TM×TN=64 个输出，64 个寄存器累加器；
-- 每个内层 k 迭代：读 8 个 A + 8 个 B，做 64 次 FMA，计算访存比 64:16 = 4:1，比 GEMM3 的 8:9 再提 3 倍多；
-- block 改为 16×16=256 线程，覆盖 128×128 的输出 tile。
-
-**如何实现**：
-
-- 累加器变为二维 `float val[TM][TN]`；
-- 计算阶段是三重循环：外层 k，内层 i（M 方向）、j（N 方向），`val[i][j] += Ads[ty*TM+i][k] * Bds[k][tx*TN+j]`；
-- 写回阶段沿 M、N 两个方向铺开 64 个元素。
+GEMM3 只粗化了 M 方向：B 值读 1 次、被 TM 个累加器共享；但 A 值每个只参与 1 次 FMA，N 方向没有任何复用，共享内存访问量仍然偏高。所以这版对 N 方向也进行粗化。
 
 ![二维线程粗化](images/sib_06_2d_blocktiling.png)
+
+**说明**：
+
+- 两个方向同时粗化：每线程负责 TM×TN=64 个输出，64 个寄存器累加器；
+- 每个内层 k 迭代：读 8 个 A + 8 个 B，做 64 次 FMA，计算访存比 64:16 = 4:1，比 GEMM3 的 8:9 进一步提升；
+- block 改为 16×16=256 线程，覆盖 128×128 的输出 tile。
 
 ```cpp
 __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, int K) {
@@ -306,16 +299,15 @@ __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, in
     __shared__ float Bds[BK][BN];
     int ty = threadIdx.y, tx = threadIdx.x;
     int tid = ty * blockDim.x + tx;
+
     // 每线程的 TM×TN=64 个寄存器累加器
     float val[TM][TN] = {0.0f};
 
     for (int tile = 0; tile < K; tile += BK) {
-        // 加载 A tile
         for (int i = tid; i < BM * BK; i += blockDim.x * blockDim.y) {
             int m = i / BK, k = i % BK;
             Ads[m][k] = A[(blockIdx.y * BM + m) * K + tile + k];
         }
-        // 加载 B tile
         for (int i = tid; i < BK * BN; i += blockDim.x * blockDim.y) {
             int k = i / BN, n = i % BN;
             Bds[k][n] = B[(tile + k) * N + blockIdx.x * BN + n];
@@ -330,18 +322,12 @@ __global__ void GEMM4(float* C, const float* A, const float* B, int M, int N, in
         __syncthreads();
     }
 
-    // 每线程沿 M、N 两个方向写入 TM×TN 个输出
+    // 每线程沿 M、N 两个方向写回 TM×TN 个输出
     for (int i = 0; i < TM; i++)
         for (int j = 0; j < TN; j++)
             C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = val[i][j];
 }
 ```
-
-
-
-native 下二维粗化收益明显（1.72×）；sm_80 下反而略降（0.97×）。GEMM4 把大量寻址计算交给编译器排布，两个后端指令调度和寄存器分配的结果不同，性能就此分叉——这是第一次出现明显的编译目标分歧，之后还会反复遇到。
-
-**代价**：64 个累加器加寻址临时变量，单线程寄存器接近 100 个，occupancy 开始下降。TM=TN=8 是常用平衡点，再放大收益递减。
 
 <table>
 <thead>
@@ -353,6 +339,11 @@ native 下二维粗化收益明显（1.72×）；sm_80 下反而略降（0.97×�
 <tr><td>GEMM4</td><td align="right">21.25</td><td align="right">6.47</td><td align="right">65.7%</td><td align="right">40.91</td><td align="right">3.36</td><td align="right">35.0%</td></tr>
 </tbody>
 </table>
+
+native 下二维粗化收益明显（1.72×）；sm_80 下反而略降（0.97×）。GEMM4 把大量寻址计算交给编译器排布，两个后端指令调度和寄存器分配的结果不同，性能就此分叉——这是第一次出现明显的编译目标分歧，之后还会反复遇到。
+
+**线程粗化的代价**：64 个累加器 + 寻址临时变量，单线程寄存器接近 100 个，occupancy 开始下降，这会降低 SM 中可供切换的 warp 数量，隐藏延迟的能力下降。
+
 
 ### 协作加载（cooperative loading）
 
