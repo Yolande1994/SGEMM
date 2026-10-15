@@ -206,11 +206,15 @@ A tile 的每个元素被 ty 方向的 32 个线程共用，B tile 的每个元�
 
 <br>
 
+---
+
 ### 阶段三：线程粗化（GEMM3、GEMM4）
 
 **GEMM2** 虽然优化了全局访存量，但每线程仍只算 1 个输出元素。内层 k 循环里每做 1 次 FMA 要读 2 次共享内存（Ads 和 Bds 各 1 次），计算访存比是 1:2，浮点单元每工作 1 拍就要等 2 次访存，大量空闲。
 
 **本阶段思路**：让一个线程同时算多个输出（线程粗化，thread tiling）。读进寄存器的数据可以被多个累加器反复使用，每次访存换来多次 FMA。寄存器是比共享内存更快的一级存储，把数据放到寄存器里复用，是后续优化的地基。
+
+<br>
 
 ## GEMM3：一维线程粗化（TM=8）
 
@@ -263,10 +267,6 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-<br>
-
-## GEMM4：二维线程粗化（TM=TN=8）
-
 <table>
 <thead>
 <tr><th>4096 尺寸</th><th colspan="3" align="center">-arch=native</th><th colspan="3" align="center">-arch=sm_80</th></tr>
@@ -277,6 +277,10 @@ __global__ void GEMM3(float* C, const float* A, const float* B, int M, int N, in
 <tr><td>GEMM3</td><td align="right">36.54</td><td align="right">3.76</td><td align="right">38.2%</td><td align="right">39.77</td><td align="right">3.46</td><td align="right">36.0%</td></tr>
 </tbody>
 </table>
+
+<br>
+
+## GEMM4：二维线程粗化（TM=TN=8）
 
 **要解决的问题**：GEMM3 只粗化了 M 方向，B 值读进寄存器 1 次只用 1 次；N 方向的复用没有利用起来，共享内存访问量仍然偏高。
 
