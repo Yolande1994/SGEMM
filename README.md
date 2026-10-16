@@ -395,24 +395,19 @@ NCU 印证了这一点：两版 Shared Load 的 LDS 请求数一字不差（335,
 
 <br>
 
-## 阶段五：float4 向量化（GEMM6、GEMM6B）
+## GEMM6：全局访存 float4 向量化
 
-**遗留问题**：全局→共享的搬运按单个 float 进行，一条 LDG 指令只搬 4 字节。搬一个 tile 需要成千上万条访存指令，load/store 单元的发射压力很大，挤占了 FMA 的发射机会。
+到目前为止，A/B 从全局到 shared 的搬运都是按 float 单个搬的。
 
-**本阶段的思路**：用 `float4` 让一条指令搬 16 字节（硬件对应 LDG.128 / STG.128），搬同样数据量的指令数降到 1/4。前提是地址 16 字节对齐、且矩阵尺寸满足 BK、BN 能被 4 整除（本仓库都是 32 的倍数）。
+每个 float（4字节）占用一条加载指令（LDG），4 字节的元素用一条 32 位的加载指令，效率不高。
 
-### GEMM6：全局访存 float4
-
-**要解决的问题**：全局加载和写回阶段指令数过多。
-
-**优化原理与实现**：
-
-- 加载循环按 float4 展开：`i` 遍历 float4 块，`k = (i % (BK/4)) * 4` 得到 float4 起始列号；
-- `*(float4*)&Ads[m][k] = *(const float4*)&A[...]`：一条指令搬 4 个 float；
-- C 写回也用 float4 打包：`float4 v = {val[i][j], ...}; *(float4*)&C[...] = v`；
-- 计算阶段保持 GEMM5 的标量寄存器结构，只动访存。
+CUDA 支持 `float4`，一条指令搬 16 字节（硬件对应 LDG.128 / STG.128），搬同样数据所需的指令数从 4 条降到 1 条（需地址 16 字节对齐，且矩阵尺寸能被 4 整除）。
 
 ![float4 向量化](images/sib_10_float4.png)
+
+**实现**：
+- 全局 → shared 的循环改写成按 float4 展开。
+- shared → 全局 的写回也用 float4。
 
 ```cpp
 __global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, int K) {
@@ -430,13 +425,14 @@ __global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, in
             int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
             *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
         }
-        // 使用 float4 向量化加载 B
+        // 使用 float4 向量化加载 B，减少访存指令
         for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
             int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
             *(float4*)&Bds[k][n] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
         }
         __syncthreads();
 
+        // 本版计算阶段依然用标量
         for (int k = 0; k < BK; k++) {
             float b_val[TN];
             for (int j = 0; j < TN; j++)
@@ -459,82 +455,61 @@ __global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, in
 }
 ```
 
-
-
-native 下 float4 收益很小（1.01×）——native 后端自己就能把标量加载合并成向量指令，收益已被编译器榨取。
-
-### GEMM6B：计算阶段 float4
+**收益**：
+- 每个线程发出的访存指令数减少到原来的 1/4（4 条 LDG 变 1 条 LDG.128），
+- 减轻 load/store 单元的发射压力，也让 SM 有更多指令槽留给 FMA。
 
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
 | GEMM5 | 21.00 | 6.55 | 66.5% |
 | GEMM6 | 20.88 | 6.58 | 66.8% |
 
-**要解决的问题**：GEMM6 只向量化了访存阶段，计算阶段读 Bds 仍是标量（一条 LDS 读 4 字节），指令数依旧偏多。
+>所有尺寸的 GEMM6 版本优化后，性能数据均比 GEMM5 有显著提升，唯有这 4096 尺寸下，GEMM6 版本未见明显变化。查询了 SASS，GEMM5 加载和写回用的是 LDG.E 和 STG.E，GEMM6 用的是 STG.E.128 和 LDG.E.128，加载与写回指令确实减少，说明优化本身是生效的。可能是 4096 尺寸下编译器把 GEMM5 的代码调度到了异常好的状态，计算已能掩盖住全局加载，指令不是关键瓶颈。
 
-**优化原理**：Bds 沿 k 方向连续，`Bds[k][tx*TN+j]` 里 j 是连续 4 个元素，可以用一条 float4 LDS 一次读入，计算阶段 LDS 指令数压到 1/4。
-Ads 不能这样：`Ads[ty*TM+i][k]` 中 i 是行方向，跨 BK=32 个步长不连续，无法用一条 float4 指令读取——这是后面阶段六要处理的引子。
+### GEMM6B：计算阶段 float4
 
-**如何实现**：
+**GEMM6** 只向量化了访存阶段，计算阶段依然是标量加载（一条 LDS 读 4 字节），指令数偏多。
 
-- 用 `float4 b_val4[TN/4]`，每 4 个 j 一条 LDS；
-- FMA 拆成 .x/.y/.z/.w 四次累加，累加器仍是标量数组。
+本版不改变任何布局、不引入 bank conflict，只在计算阶段把 Bds 的加载改成 float4 向量化，
+
+加载 Ads 不使用 float4，因为 Ads[ty * TM + i][k] 里 i 是行方向，跨 BK 个步长，不连续，无法用一条 float4 指令加载。
 
 ```cpp
-__global__ void GEMM6B(float* C, const float* A, const float* B, int M, int N, int K) {
-    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
-    __shared__ float Ads[BM][BK];
-    __shared__ float Bds[BK][BN];
-    int ty = threadIdx.y, tx = threadIdx.x;
-    int tid = ty * blockDim.x + tx;
-    float val[TM][TN] = {0.0f};
-
-    for (int tile = 0; tile < K; tile += BK) {
-        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
-            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
-            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
-        }
-        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
-            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
-            *(float4*)&Bds[k][n] = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
-        }
-        __syncthreads();
-
-        for (int k = 0; k < BK; k++) {
-            // B 侧每 4 个 j 用一条 float4 读取，把 LDS 指令数压到 1/4
-            float4 b_val4[TN / 4];
-            for (int j = 0; j < TN; j += 4)
-                b_val4[j / 4] = *(const float4*)&Bds[k][tx * TN + j];
-            for (int i = 0; i < TM; i++) {
-                float a_val = Ads[ty * TM + i][k];
-                for (int j = 0; j < TN; j += 4) {
-                    val[i][j + 0] += a_val * b_val4[j / 4].x;
-                    val[i][j + 1] += a_val * b_val4[j / 4].y;
-                    val[i][j + 2] += a_val * b_val4[j / 4].z;
-                    val[i][j + 3] += a_val * b_val4[j / 4].w;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    for (int i = 0; i < TM; i++)
+// 仅改动计算阶段
+for (int k = 0; k < BK; k++) {
+    // B 侧每 4 个 j 用一条 float4 读取，把 LDS 指令数压到 1/4
+    float4 b_val4[TN / 4];
+    for (int j = 0; j < TN; j += 4)
+        b_val4[j / 4] = *(const float4*)&Bds[k][tx * TN + j];
+    for (int i = 0; i < TM; i++) {
+        float a_val = Ads[ty * TM + i][k];
         for (int j = 0; j < TN; j += 4) {
-            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
-            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
+            val[i][j + 0] += a_val * b_val4[j / 4].x;
+            val[i][j + 1] += a_val * b_val4[j / 4].y;
+            val[i][j + 2] += a_val * b_val4[j / 4].z;
+            val[i][j + 3] += a_val * b_val4[j / 4].w;
         }
+    }
 }
+__syncthreads();
 ```
 
+![float4 计算向量化](images/GEMM6B_ncu.png)
 
+```
+LDS R.., [R77]          // A 侧标量读（跨行，不连续，无法合并）
+LDS.128 R.., [R76]      // B 侧 8 个连续元素 → 编译器自动合并成 2 条 128 位
+LDS R.., [R77+0x80*i]   // A 侧其余 7 个（跨 0x80 步长）
+LDS.128 R.., [R76+0x10]
+FFMA
+```
 
-native 下计算阶段 float4 带来 1.12×，计算阶段 LDS 指令数压到 1/4。GEMM6B 之后性能进入平台期，真正的瓶颈已经转移到共享内存 bank 冲突上——下一阶段专门处理它。
-
-<br>
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
 | GEMM6 | 20.88 | 6.58 | 66.8% |
 | GEMM6B | 18.58 | 7.40 | 75.1% |
+
+<br>
 
 ## 阶段六：共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
