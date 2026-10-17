@@ -517,7 +517,7 @@ FFMA
 
 ## 关于共享内存 Bank 冲突（GEMM7、GEMM7B、GEMM8）
 
-共享内存被组织成 32 个 bank（bank 编号按 "地址%32" 计算）。一个 warp 访问共享内存时，如果 32 个线程落在 32 个不同 bank，一次就能取完；如果有多个线程落在同一个 bank，硬件只能把它们串行化排队执行，叫 **bank conflict**。
+共享内存被组织成 32 个 bank。一个 warp 访问共享内存时，如果 32 个线程落在 32 个不同 bank，一次就能取完；如果有多个线程落在同一个 bank，硬件只能把它们串行化排队执行，叫 **bank conflict**。
 
 >冲突路数 = 同一 bank 上串行的线程数量，n 路冲突意味着吞吐量掉到理论值的 1/n。
 
@@ -595,13 +595,32 @@ __global__ void GEMM7(float* C, const float* A, const float* B, int M, int N, in
 
 布局一改，加载阶段和计算阶段的 bank 分布变化，加载与计算阶段都出现冲突：
 
-- **加载写入**： 共享内存的 bank 编号 = 地址 % 32，`Bds[n][k]` 的地址 = n×32 + k，**每行正好是 32 的倍数**，所以行号 n 贡献的偏移在取余数时被**整个消掉**，**bank 只看列号 k，行号 n 不起作用**。同一列的所有行，全堵在同一个 Bank 里，形成 32 路冲突。
-- **计算读取**： `Bds[tx*TN+j][k]`，bank = k%32，block 16×16 里 16 个不同行号的线程全堵在 bank k 上 → 16 路冲突；
-- > 以上是按标量标准进行的计算
+- **加载写入**： 共享内存的 bank 编号 = 地址 % 32。`Bds[n][k]` 的地址 = n×32 + k，每行正好 32 个 float，行号 n 贡献的偏移（n×32）在取余数时被**整个消掉**，**bank 只看列号 k，行号 n 不起作用**。加载时 warp 内所有线程写同一列 k → 32 个不同地址全堵在同一个 bank → 32 路冲突（NCU 实测 26.7-way）。
 
-#### 难道 GEMM6 没有冲突吗？
+- **计算读取**： `Bds[tx*TN+j][k]` 是 float4 读（LDS.128），block（16×16）里 16 个不同行号的数据全落在相同的 4 个 bank（k~k+3）上，冲突严重（NCU 实测 17.0-way，见下表）。
 
-GEMM6 的 `Bds[k][n]` 是 `[32][128]`，行宽 128 同样是 32 的倍数，bank = n % 32。计算阶段读 `Bds[k][tx×8+j]`，同一时刻 j 固定，tx×8 对 32 取余有 0、8、16、24 四个值，32 个线程被分到 4 个 bank → **4-way 冲突**（NCU 实测平均 3.2-way），损失较小。
+#### 难道 GEMM6B 没有冲突吗？
+
+GEMM6B 的 `Bds[k][n]` 是 `[32][128]`，行宽 128 同样是 32 的倍数，bank = n % 32。B 侧 float4 读和 A 侧标量读都存在轻度的 bank 重叠，NCU 实测混合平均 3.2-way 与 4.5-way，损失较小。
+
+同样遵守 "行宽 32 的倍数" 规律，冲突程度却天差地别，差别全在访问模式。
+
+**两张 NCU 共享内存 Bank 冲突截图（M=N=K=4096，上：GEMM6B，下：GEMM7）：**
+
+![bank_conflict：GEMM7 vs GEMM6B](images/GEMM7_ncu.png)
+
+| | GEMM6B | GEMM7 |
+| --- | ---: | ---: |
+| 计算读指令 | LDS.128 + LDS.32 混合 | 全 LDS.128 |
+| Shared Load 平均冲突 | 3.2-way | 17.0-way |
+| Shared Load 冲突 wavefronts 占比 | 50.07% | 82.35% |
+| Shared Store 平均冲突 | 4.5-way | 26.7-way |
+| Shared Store 冲突 wavefronts 占比 | 12.03% | 94.00% |
+
+口径：NCU 的 "way" = 实际 wavefronts ÷ 请求数。128 位访问无冲突也拆成 4 波（显示 4.0-way）；GEMM6B 为 LDS.128 与 LDS.32 混合，无冲突基准介于 1~4 之间，3.2-way 是混合平均口径。
+
+两版 B 侧计算读同为 float4（GEMM6B 已引入、GEMM7 沿用），A 侧读两版都是轻度重叠（GEMM6B 标量、GEMM7 float4），冲突的影响不大。影响 bank 冲突的变量只有 Bds 布局 [BK][BN] → [BN][BK]：Load 3.2 → 17.0、Store 4.5 → 26.7，加载与计算两侧冲突都恶化。
+
 
 > bank conflict 是隐蔽的性能杀手，改布局需特别注意。
 
@@ -617,24 +636,30 @@ GEMM7 已经把 B 布局改成了 [BN][BK]。既然引起了冲突，就来消�
 // GEMM7：
 for (k = 0; k < BK; k += 4) {}
 
-// GEMM7B：用 k_offset 旋转，不同线程从不同 k 开始，打散 bank
+// GEMM7B：用 k_offset 旋转，wavefront 内 8 个线程从不同的 k 开始，打散 bank
 for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
     int k = k_offset % BK;
-    // 这样线程 tid 从 k = tid*4 开始，绕一圈回到起始位置。warp 内 32 个线程的起始 k 各不相同，访问时落在不同的 bank。
     // ...其他代码全部一样
 }
 ```
 
-warp 内 32 个线程起始 k 各不相同，访问分散到不同 bank，计算阶段冲突从 16 路降到 2 路。
+![bank_conflict：GEMM7B vs GEMM7](images/GEMM7B_ncu.png)
+
+	GEMM7	GEMM7B
+Shared Load 平均冲突	17.0-way	4.0-way（无冲突）
+Shared Store 平均冲突	26.7-way	26.8-way
+
+`k = (tid×4) % 32`，硬件把 128 位访问按 8 线程 wavefront 执行，一个 wavefront 恰好 8 个线程，起始 k 各不相同、正好铺满 32 个 bank → 每个 wavefront 内无冲突。NCU 实测计算段冲突从 17.0-way 降到 **4.0-way**（4.0 就是 128 位访问的无冲突基准，冲突数接近 0）：
 
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
+| GEMM6B | 18.58 | 7.40 | 75.1% |
 | GEMM7 | 42.32 | 3.25 | 33.0% |
 | GEMM7B | 21.29 | 6.46 | 65.6% |
 
-k_offset 只解决了计算阶段的冲突，加载阶段转置写入 Bds[BN][BK] 的代码一字未改，warp 内所有线程仍在写同一列 k，bank = k，是 32 路冲突。
+k_offset 只解决了计算阶段的冲突，加载阶段转置写入 `Bds[BN][BK]` 的代码一字未改，warp 内所有线程仍在写同一列 k，bank = k，仍是 32 路冲突（NCU 实测 26.8-way，与 GEMM7 几乎一样）。
 
-所以在加载阶段， GEMM7B 要比 GEMM6 慢得多，即使修复计算阶段冲突，性能也比 GEMM6 低。
+所以在加载阶段，GEMM7B 要比 GEMM6B 慢得多，即使修复计算阶段冲突，整体性能也比 GEMM6B 低。
 
 下一版 GEMM8 用 XOR Swizzle 同时消除加载与计算两个阶段的冲突。
 
