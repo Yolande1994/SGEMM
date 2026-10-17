@@ -501,9 +501,9 @@ SASS（计算阶段，原B侧 LDS → LDS.128）：
 ![GEMM6B 计算向量化](images/GEMM6B_ncu.png)
 
 ```
-LDS R.., [R77]          // A 侧标量读（跨行，不连续，无法合并，还是LDS）
-LDS.128 R.., [R76]      // B 侧 8 个连续元素 → 编译器自动合并成 2 条 128 位
-LDS R.., [R77+0x80*i]   // A 侧其余 7 个
+LDS R.., [R77]           // A 侧标量读（跨行，不连续，无法合并，还是LDS）
+LDS.128 R.., [R76]       // B 侧 8 个连续元素 → 编译器自动合并成 2 条 128 位
+LDS R.., [R77+0x80*i]    // A 侧其余 7 个
 LDS.128 R.., [R76+0x10]
 FFMA
 ```
@@ -521,11 +521,11 @@ FFMA
 
 >冲突路数 = 同一 bank 上串行的线程数量，n 路冲突意味着吞吐量掉到理论值的 1/n。
 
-![bank 冲突](images/sib_11_bank_conflict.png)
+![bank 冲突](images/bank_conflict.png)
 
 ## GEMM7：转置布局反例（刻意保留的负面教材）
 
-**动机**：GEMM6B 已经量化过：计算阶段用 float4 确实能带来一点提升。而且 GEMM6B 只在加载 Bds 时使用 float4，加载 Ads 仍然是标量，那如果把 Ads 也改成用 float4，能不能再提升一点呢？
+**动机**：GEMM6B 已经量化过：计算阶段用 float4 能带来一点提升。而且 GEMM6B 只在加载 Bds 时使用 float4，加载 Ads 仍然是标量，那如果把 Ads 也改成用 float4，能不能再提升一点呢？
 
 既然 float4 要求数据沿连续的方向存储，一个自然的想法就是："把 Bds 的布局从 `[BK][BN]` 改成 `[BN][BK]`，这样就和 Ads 的布局一致，两者都沿 K 连续，就都可以用 float4 加载了。"
 
@@ -586,100 +586,61 @@ __global__ void GEMM7(float* C, const float* A, const float* B, int M, int N, in
 
 然而代价随之而来...
 
-
-
-**为什么性能腰斩**：数组形状 [32][32] 时每行正好 32 个 float，同一列 k 的所有行落在同一个 bank：
-
-- **加载写入** `Bds[n][k]`：bank = k%32，warp 内所有线程的 k 相同 → 32 路冲突；
-- **计算读取** `Bds[tx*TN+j][k]`：bank = k%32，block 16×16 里 16 个不同行号的线程全堵在 bank k 上 → 16 路冲突；
-- NCU 实测计算吞吐利用率掉到 20.7%、显存吞吐 94%，SM 基本不计算，时间全耗在共享内存排队上。4096 尺寸耗时 42.32 ms，比 GEMM6B 慢一倍多。
-
-**教训**：bank conflict 是隐蔽的性能杀手。布局一改、bank 分布跟着变，就可能引入冲突——**改布局必须同时检查加载和计算两处访存**。
-
-GEMM7 是本仓库唯一的纯负面教材：性能比上一版腰斩（native 0.49×）。保留它是为了直观展示"为了一点收益乱改布局"的代价。
-
-### GEMM7B：k_offset 循环移位（只修好一半）
-
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
 | GEMM6B | 18.58 | 7.40 | 75.1% |
 | GEMM7 | 42.32 | 3.25 | 33.0% |
 
-**做了什么**：与 GEMM7 的唯一区别在计算循环的 k 起点——按线程编号旋转：
+#### 为什么性能腰斩？
 
+布局一改，加载阶段和计算阶段的 bank 分布变化，加载与计算阶段都出现冲突：
+
+- **加载写入**： 共享内存的 bank 编号 = 地址 % 32，`Bds[n][k]` 的地址 = n×32 + k，**每行正好是 32 的倍数**，所以行号 n 贡献的偏移在取余数时被**整个消掉**。结果**bank 只看列号 k，行号 n 不起作用**。同一列的所有行，全堵在同一个 Bank 里，形成 32 路冲突。
+- **计算读取**： `Bds[tx*TN+j][k]`，bank = k%32，block 16×16 里 16 个不同行号的线程全堵在 bank k 上 → 16 路冲突；
+
+#### 难道 GEMM6 没有冲突吗？
+
+GEMM6 的 `Bds[k][n]` 是 `[32][128]`，行宽 128 同样是 32 的倍数，bank = n % 32。计算阶段读 `Bds[k][tx×8+j]`，同一时刻 j 固定，`tx×8` 对 32 取余有 0、8、16、24 四个值，32 个线程被分到 4 个 bank → **4-way 冲突**（NCU 实测平均 3.2-way），损失较小。
+
+GEMM7 把 Bds 改成 `[128][32]`，行宽 32，bank = k % 32，warp 内所有线程的 k 都一样，挤进同一个 bank：加载 32 路、计算 16 路，吞吐掉到 1/16 ~ 1/32，损失很大。
+
+> bank conflict 是隐蔽的性能杀手。布局一改，bank 分布跟着变，可能引入冲突。改布局需特别注意。
+
+### GEMM7B：k_offset 循环移位（消除计算阶段的冲突）
+
+GEMM7 已经把 B 布局改成了 [BN][BK]。既然引起了冲突，就来消除冲突，本版在不放弃这个布局的前提下，尝试把它带来的冲突修掉。
+
+首先只看**计算阶段**的冲突：GEMM7 冲突根源之一是"warp 内所有线程访问相同的 k 列"，如果让不同线程从不同的 k 开始访问，就能把访问分散到不同的 bank。
+
+**实现**：和 GEMM7 相比只改一处：计算循环里 k 的起点：
 ```cpp
+// GEMM7：
+for (k = 0; k < BK; k += 4) {}
+
+// GEMM7B：用 k_offset 旋转，不同线程从不同 k 开始，打散 bank
 for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
-    int k = k_offset % BK;   // 不同线程从不同 k 开始，绕一圈回起点
-    ...
+    int k = k_offset % BK;
+    // 这样线程 tid 从 k = tid*4 开始，绕一圈回到起始位置。warp 内 32 个线程的起始 k 各不相同，访问时落在不同的 bank。
+    // ...其他代码全部一样
 }
 ```
 
 warp 内 32 个线程起始 k 各不相同，访问分散到不同 bank，计算阶段冲突从 16 路降到 2 路。
 
-**为什么仍不快**：k_offset 只解决了计算阶段。加载阶段转置写入 `Bds[BN][BK]` 的代码一字未改，warp 内所有线程仍在写同一列 k，仍是 32 路冲突。治标不治本，整体性能 6.46 TFLOPS，还是不如 GEMM6B。
-
-```cpp
-__global__ void GEMM7B(float* C, const float* A, const float* B, int M, int N, int K) {
-    constexpr int BK = 32, BM = 128, BN = 128, TM = 8, TN = 8;
-    __shared__ float Ads[BM][BK];
-    __shared__ float Bds[BN][BK];
-    int ty = threadIdx.y, tx = threadIdx.x;
-    int tid = ty * blockDim.x + tx;
-    float val[TM][TN] = {0.0f};
-
-    for (int tile = 0; tile < K; tile += BK) {
-        for (int i = tid; i < BM * (BK / 4); i += blockDim.x * blockDim.y) {
-            int m = i / (BK / 4), k = (i % (BK / 4)) * 4;
-            *(float4*)&Ads[m][k] = *(const float4*)&A[(blockIdx.y * BM + m) * K + tile + k];
-        }
-        for (int i = tid; i < BK * (BN / 4); i += blockDim.x * blockDim.y) {
-            int k = i / (BN / 4), n = (i % (BN / 4)) * 4;
-            float4 v = *(const float4*)&B[(tile + k) * N + blockIdx.x * BN + n];
-            Bds[n + 0][k] = v.x;
-            Bds[n + 1][k] = v.y;
-            Bds[n + 2][k] = v.z;
-            Bds[n + 3][k] = v.w;
-        }
-        __syncthreads();
-
-        // 本版核心：k_offset 旋转，不同线程从不同 k 开始，打散 bank
-        // 与 GEMM7 唯一区别就在这一行 k 的起点，其他完全相同
-        for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
-            int k = k_offset % BK;
-            float4 b_val[TN];
-            for (int j = 0; j < TN; j++)
-                b_val[j] = *(const float4*)&Bds[tx * TN + j][k];
-            for (int i = 0; i < TM; i++) {
-                float4 a_val = *(const float4*)&Ads[ty * TM + i][k];
-                for (int j = 0; j < TN; j++) {
-                    val[i][j] += a_val.x * b_val[j].x;
-                    val[i][j] += a_val.y * b_val[j].y;
-                    val[i][j] += a_val.z * b_val[j].z;
-                    val[i][j] += a_val.w * b_val[j].w;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    for (int i = 0; i < TM; i++)
-        for (int j = 0; j < TN; j += 4) {
-            float4 v = {val[i][j], val[i][j+1], val[i][j+2], val[i][j+3]};
-            *(float4*)&C[(blockIdx.y * BM + ty * TM + i) * N + blockIdx.x * BN + tx * TN + j] = v;
-        }
-}
-```
-
-
-
-k_offset 把计算阶段修复后性能从 3.25 提到 6.46 TFLOPS（1.99×/1.97×），但加载阶段的 32 路冲突还在，仍低于 GEMM6B 的 7.40。下一步要把两处冲突一次解决。
-
-### GEMM8：XOR Swizzle（一次解决两处冲突）
-
 | 版本 | 耗时(ms) | TFLOPS | 占cuBLAS % |
 | --- | ---: | ---: | ---: |
 | GEMM7 | 42.32 | 3.25 | 33.0% |
 | GEMM7B | 21.29 | 6.46 | 65.6% |
+
+k_offset 只解决了计算阶段的冲突，加载阶段转置写入 Bds[BN][BK] 的代码一字未改，warp 内所有线程仍在写同一列 k，bank = k，是 32 路冲突。
+
+所以在加载阶段， GEMM7B 要比 GEMM6 慢得多，即使修复计算阶段冲突，性能也比 GEMM6 低。
+
+下一版 GEMM8 用 XOR Swizzle 同时消除加载与计算两个阶段的冲突。
+
+<br>
+
+## GEMM8：XOR Swizzle
 
 **优化原理**：不改变物理存储大小，通过按位异或把"行号的一部分位"混入"列地址"，让相同列 k 在不同行 n 上落到不同的 bank：
 
