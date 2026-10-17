@@ -466,9 +466,8 @@ __global__ void GEMM6(float* C, const float* A, const float* B, int M, int N, in
 
 > 所有尺寸的 GEMM6 经向量化优化后，性能数据均比 GEMM5 有显著提升，唯有这 4096 尺寸下，GEMM6 版本未见明显变化。查询了 SASS，GEMM5 加载和写回用的是 LDG.E 和 STG.E，GEMM6 用的是 STG.E.128 和 LDG.E.128，加载与写回指令确实减少，说明优化本身是生效的。可能是 4096 尺寸下编译器把 GEMM5 的代码调度到了异常好的状态，计算已能掩盖住全局加载，指令不是关键瓶颈。（我相信计算机没有秘密，但时间有限，我无法在这个点上继续深究）
 
-<br>
 
-### GEMM6B：计算阶段 float4
+## GEMM6B：计算阶段 float4
 
 **GEMM6** 只向量化了访存阶段，计算阶段依然是标量加载（一条 LDS 读 4 字节）。
 
@@ -621,11 +620,10 @@ GEMM6B 的 `Bds[k][n]` 是 `[32][128]`，行宽 128 同样是 32 的倍数，ban
 
 两版 B 侧计算读同为 float4（GEMM6B 已引入、GEMM7 沿用），A 侧读两版都是轻度重叠（GEMM6B 标量、GEMM7 float4），冲突的影响不大。影响 bank 冲突的变量只有 Bds 布局 [BK][BN] → [BN][BK]：Load 3.2 → 17.0、Store 4.5 → 26.7，加载与计算两侧冲突都恶化。
 
-
 > bank conflict 是隐蔽的性能杀手，改布局需特别注意。
 
 
-### GEMM7B：k_offset 循环移位（消除计算阶段的冲突）
+## GEMM7B：k_offset 循环移位（消除计算阶段的冲突）
 
 GEMM7 已经把 B 布局改成了 [BN][BK]。既然引起了冲突，就来消除冲突，本版在不放弃这个布局的前提下，尝试把它带来的冲突修掉。
 
@@ -643,11 +641,14 @@ for (int k_offset = tid * 4; k_offset < BK + tid * 4; k_offset += 4) {
 }
 ```
 
-![bank_conflict：GEMM7B vs GEMM7](images/GEMM7B_ncu.png)
+**GEMM7B NCU 截图：**
 
-	GEMM7	GEMM7B
-Shared Load 平均冲突	17.0-way	4.0-way（无冲突）
-Shared Store 平均冲突	26.7-way	26.8-way
+![bank_conflict：GEMM7B](images/GEMM7B_ncu.png)
+
+| | GEMM7 | GEMM7B |
+| --- | ---: | ---: |
+| Shared Load 平均冲突 | 17.0-way | 4.0-way（无冲突） |
+| Shared Store 平均冲突 | 26.7-way | 26.8-way |
 
 `k = (tid×4) % 32`，硬件把 128 位访问按 8 线程 wavefront 执行，一个 wavefront 恰好 8 个线程，起始 k 各不相同、正好铺满 32 个 bank → 每个 wavefront 内无冲突。NCU 实测计算段冲突从 17.0-way 降到 **4.0-way**（4.0 就是 128 位访问的无冲突基准，冲突数接近 0）：
 
